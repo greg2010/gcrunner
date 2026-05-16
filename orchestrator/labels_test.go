@@ -186,6 +186,30 @@ func TestParseLabels_DefaultsAreExactMode(t *testing.T) {
 	}
 }
 
+func TestParseLabels_KVM(t *testing.T) {
+	tests := []struct {
+		name   string
+		labels []string
+		want   bool
+	}{
+		{"unset defaults to false", []string{"gcrunner=test"}, false},
+		{"kvm=true enables", []string{"gcrunner=test/kvm=true"}, true},
+		{"kvm=false disables", []string{"gcrunner=test/kvm=false"}, false},
+		{"any other value disables", []string{"gcrunner=test/kvm=yes"}, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			labels := parseLabels(tt.labels)
+			if labels == nil {
+				t.Fatal("expected labels, got nil")
+			}
+			if labels.KVM != tt.want {
+				t.Errorf("KVM = %v, want %v", labels.KVM, tt.want)
+			}
+		})
+	}
+}
+
 func TestParseLabels_NotGcrunner(t *testing.T) {
 	labels := parseLabels([]string{"self-hosted", "linux"})
 	if labels != nil {
