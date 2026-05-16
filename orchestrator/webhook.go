@@ -476,15 +476,35 @@ func handleQueued(ctx context.Context, event WorkflowJobEvent) error {
 	return createRunnerVM(ctx, event, labels)
 }
 
+// vmDeleter is the function used to delete a VM. Replaceable in tests.
+var vmDeleter = deleteRunnerVM
+
 func handleCompleted(ctx context.Context, event WorkflowJobEvent) error {
 	labels := parseLabels(event.WorkflowJob.Labels)
 	if labels == nil {
 		return nil
 	}
 
-	instanceName := fmt.Sprintf("gcrunner-%d-%d", event.WorkflowJob.RunID, event.WorkflowJob.ID)
-	log.Printf("Job %d: completed, deleting VM %s", event.WorkflowJob.ID, instanceName)
-	return deleteRunnerVM(ctx, instanceName)
+	// GitHub records the actual runner that picked up the job in
+	// workflow_job.runner_name. Because the JIT registration in
+	// createRunnerVM uses the VM's instance name as the runner name, that
+	// field is the authoritative VM to delete — even when GitHub's
+	// label-based dispatch hands the job to a runner the orchestrator
+	// originally created for a different job. Reconstructing the name
+	// from job_id alone can delete a VM running an unrelated workload.
+	name := event.WorkflowJob.RunnerName
+	if name == "" {
+		// runner_name is empty when the job is cancelled or otherwise
+		// completed before any runner picked it up. In that case the
+		// reconstructed name still matches what createRunnerVM produced.
+		name = fmt.Sprintf("gcrunner-%d-%d", event.WorkflowJob.RunID, event.WorkflowJob.ID)
+		log.Printf("Job %d: completed with empty runner_name, falling back to %s", event.WorkflowJob.ID, name)
+	}
+	if !strings.HasPrefix(name, "gcrunner-") {
+		return fmt.Errorf("refusing to delete VM with unexpected name: %q", name)
+	}
+	log.Printf("Job %d: completed, deleting VM %s", event.WorkflowJob.ID, name)
+	return vmDeleter(ctx, name)
 }
 
 func verifySignature(payload []byte, signature, secret string) bool {
@@ -509,9 +529,10 @@ type WorkflowJobEvent struct {
 }
 
 type WorkflowJob struct {
-	ID     int64    `json:"id"`
-	RunID  int64    `json:"run_id"`
-	Labels []string `json:"labels"`
+	ID         int64    `json:"id"`
+	RunID      int64    `json:"run_id"`
+	RunnerName string   `json:"runner_name"`
+	Labels     []string `json:"labels"`
 }
 
 type Repository struct {
