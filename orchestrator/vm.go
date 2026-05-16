@@ -138,6 +138,11 @@ func createInstance(ctx context.Context, name, zone, machineType string, labels 
 	defer client.Close()
 
 	project := os.Getenv("GCP_PROJECT")
+	if labels.KVM {
+		if err := validateKVMSupported(machineType); err != nil {
+			return err
+		}
+	}
 	machineType = fmt.Sprintf("zones/%s/machineTypes/%s", zone, machineType)
 	sourceImage := resolveSourceImage(labels.Image)
 
@@ -195,8 +200,14 @@ func createInstance(ctx context.Context, name, zone, machineType string, labels 
 	// Set spot scheduling if requested
 	if labels.Spot {
 		instance.Scheduling = &computepb.Scheduling{
-			ProvisioningModel:  proto.String("SPOT"),
+			ProvisioningModel:         proto.String("SPOT"),
 			InstanceTerminationAction: proto.String("DELETE"),
+		}
+	}
+
+	if labels.KVM {
+		instance.AdvancedMachineFeatures = &computepb.AdvancedMachineFeatures{
+			EnableNestedVirtualization: proto.Bool(true),
 		}
 	}
 
@@ -287,6 +298,26 @@ const (
 	insertErrorFatal
 	insertErrorAlreadyExists
 )
+
+// kvmUnsupportedFamilies lists machine families where GCE cannot expose
+// /dev/kvm to the guest. Includes families that disable Intel VMX / AMD SVM
+// (e2) and Tau VMs (t2d, t2a). Other families are passed through and GCE
+// will reject at insert time if support is missing.
+var kvmUnsupportedFamilies = map[string]bool{
+	"e2":  true,
+	"t2d": true,
+	"t2a": true,
+}
+
+// validateKVMSupported returns an error if the resolved machine type belongs
+// to a family that cannot host a nested hypervisor.
+func validateKVMSupported(machineType string) error {
+	family, _ := parseMachineFamily(machineType)
+	if kvmUnsupportedFamilies[family] {
+		return fmt.Errorf("nested virtualization (kvm=true) not supported on machine family %q (type %q); use n1/n2/n2d/c2/c3/c3d", family, machineType)
+	}
+	return nil
+}
 
 // classifyInsertError categorizes a VM creation error to decide whether to retry.
 func classifyInsertError(err error) insertErrorKind {

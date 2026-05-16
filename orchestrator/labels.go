@@ -5,8 +5,8 @@ import "strings"
 // RunnerLabels holds the parsed gcrunner label configuration.
 type RunnerLabels struct {
 	RunID    string
-	Machine  string   // Exact machine type (e.g. "n2d-standard-4", "e2-micro")
-	Family   string   // Machine family for resolution (e.g. "n2d", "n2d+c3")
+	Machine  string // Exact machine type (e.g. "n2d-standard-4", "e2-micro")
+	Family   string // Machine family for resolution (e.g. "n2d", "n2d+c3")
 	Spot     bool
 	Disk     string
 	DiskType string
@@ -14,6 +14,7 @@ type RunnerLabels struct {
 	CPU      string // "4" or "2+8" (range)
 	RAM      string // "16" or "8+32" (range)
 	Zone     string // "us-central1-a" or "us-central1-a+us-central1-b"
+	KVM      bool   // Enable nested virtualization (/dev/kvm inside the VM)
 	// MachineMode is computed after parsing:
 	//   "exact"  — Machine is set, use as-is
 	//   "family" — Family is set, resolve with cpu/ram constraints
@@ -65,6 +66,8 @@ func parseLabels(labels []string) *RunnerLabels {
 				result.RAM = kv[1]
 			case "zone":
 				result.Zone = kv[1]
+			case "kvm":
+				result.KVM = kv[1] == "true"
 			}
 		}
 
