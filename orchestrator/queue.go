@@ -68,6 +68,11 @@ func enqueueTask(ctx context.Context, path string, payload []byte, jobID int64) 
 					AuthorizationHeader: &taskspb.HttpRequest_OidcToken{
 						OidcToken: &taskspb.OidcToken{
 							ServiceAccountEmail: tasksSAEmail,
+							// Pin the audience to the bare Cloud Run service URL.
+							// Cloud Tasks otherwise defaults to the full request
+							// URL (cloudRunURL+path) as the aud claim, which would
+							// not match the audience the receiver checks against.
+							Audience: cloudRunURL,
 						},
 					},
 				},
