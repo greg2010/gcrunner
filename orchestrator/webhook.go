@@ -19,6 +19,7 @@ import (
 
 	secretmanager "cloud.google.com/go/secretmanager/apiv1"
 	secretmanagerpb "cloud.google.com/go/secretmanager/apiv1/secretmanagerpb"
+	"google.golang.org/api/idtoken"
 )
 
 var (
@@ -411,9 +412,57 @@ func handleWebhook(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprintf(w, "ok")
 }
 
-// HandleTask handles requests from Cloud Tasks at /task/* paths.
-// Cloud Run IAM ensures only the tasks SA can invoke this endpoint.
-// The X-CloudTasks-TaskName header is set automatically by Cloud Tasks.
+// taskTokenValidator validates an OIDC ID token against an audience and returns
+// the decoded payload. Package variable so tests can stub the network-dependent
+// google.golang.org/api/idtoken call without standing up Google's cert endpoint.
+var taskTokenValidator = func(ctx context.Context, token, audience string) (*idtoken.Payload, error) {
+	return idtoken.Validate(ctx, token, audience)
+}
+
+// verifyTaskRequest authenticates a /task/* request by validating the OIDC ID
+// token Cloud Tasks attaches in the Authorization header. The token must be
+// issued by Google for the tasks service account (CLOUD_TASKS_SA_EMAIL) with
+// the audience set to this service's Cloud Run URL (CLOUD_RUN_URL).
+//
+// The Cloud Run service is publicly invokable (allUsers) for the GitHub webhook
+// path, so /task/* cannot rely on IAM and must authenticate the token itself.
+func verifyTaskRequest(ctx context.Context, r *http.Request) error {
+	const prefix = "Bearer "
+	auth := r.Header.Get("Authorization")
+	if !strings.HasPrefix(auth, prefix) {
+		return fmt.Errorf("missing or malformed Authorization header")
+	}
+	token := strings.TrimPrefix(auth, prefix)
+
+	audience := os.Getenv("CLOUD_RUN_URL")
+	if audience == "" {
+		return fmt.Errorf("CLOUD_RUN_URL not set")
+	}
+	expectedEmail := os.Getenv("CLOUD_TASKS_SA_EMAIL")
+	if expectedEmail == "" {
+		return fmt.Errorf("CLOUD_TASKS_SA_EMAIL not set")
+	}
+
+	payload, err := taskTokenValidator(ctx, token, audience)
+	if err != nil {
+		return fmt.Errorf("validate id token: %w", err)
+	}
+
+	email, _ := payload.Claims["email"].(string)
+	emailVerified, _ := payload.Claims["email_verified"].(bool)
+	if email != expectedEmail {
+		return fmt.Errorf("unexpected issuer email")
+	}
+	if !emailVerified {
+		return fmt.Errorf("issuer email not verified")
+	}
+	return nil
+}
+
+// HandleTask handles requests from Cloud Tasks at /task/* paths. The Cloud Run
+// service grants roles/run.invoker to allUsers (for GitHub webhooks), so this
+// handler must authenticate inbound requests itself via the OIDC token Cloud
+// Tasks attaches.
 func HandleTask(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
@@ -422,9 +471,9 @@ func HandleTask(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Verify the request comes from Cloud Tasks
-	if r.Header.Get("X-CloudTasks-TaskName") == "" {
-		http.Error(w, "forbidden", http.StatusForbidden)
+	if err := verifyTaskRequest(ctx, r); err != nil {
+		log.Printf("Task auth failed: %v", err)
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
 		return
 	}
 
