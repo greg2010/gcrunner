@@ -38,3 +38,9 @@ variable "gcrunner_version" {
   type        = string
   default     = "v0.2.0"
 }
+
+variable "gcrunner_image_repo" {
+  description = "GHCR repository path for the orchestrator image, in <owner>/<repo> form"
+  type        = string
+  default     = "camdenclark/gcrunner"
+}
