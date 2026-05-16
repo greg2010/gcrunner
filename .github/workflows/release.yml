@@ -22,14 +22,18 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: Compute image name
+        id: img
+        run: echo "name=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
+
       - name: Build and push versioned image
         uses: docker/build-push-action@v6
         with:
           context: ./orchestrator
           push: true
           tags: |
-            ghcr.io/camdenclark/gcrunner:${{ github.ref_name }}
-            ghcr.io/camdenclark/gcrunner:latest
+            ${{ steps.img.outputs.name }}:${{ github.ref_name }}
+            ${{ steps.img.outputs.name }}:latest
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
