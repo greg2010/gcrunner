@@ -47,3 +47,16 @@ resource "google_secret_manager_secret_version" "setup_token" {
   secret      = google_secret_manager_secret.setup_token.id
   secret_data = random_password.setup_token.result
 }
+
+# Sentinel: a non-empty latest version means /setup is locked. Written by the
+# orchestrator after the first successful callback. Terraform creates the
+# secret with no versions; the orchestrator writes the first version.
+resource "google_secret_manager_secret" "setup_completed" {
+  secret_id = "gcrunner-setup-completed"
+
+  replication {
+    auto {}
+  }
+
+  depends_on = [google_project_service.apis["secretmanager.googleapis.com"]]
+}
