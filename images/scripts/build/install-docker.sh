@@ -44,6 +44,10 @@ done
 gid=$(cut -d ":" -f 3 /etc/group | grep "^1..$" | sort -n | tail -n 1 | awk '{ print $1+1 }')
 groupmod -g "$gid" docker
 
+# Add the runner user to the docker group so workflows can use the docker
+# CLI without sudo. Matches actions/runner-images convention.
+usermod -aG docker runner
+
 # Enable docker.service
 systemctl is-active --quiet docker.service || systemctl start docker.service
 systemctl is-enabled --quiet docker.service || systemctl enable docker.service
