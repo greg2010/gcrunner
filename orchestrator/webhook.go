@@ -108,6 +108,26 @@ func HandleWebhook(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// setupCompletedSecret is the sentinel: if it has a non-empty latest version,
+// /setup and /setup/callback refuse further requests. The orchestrator writes
+// this on the first successful callback so a later holder of the setup token
+// cannot pivot the orchestrator's GitHub App trust to an App they control.
+const setupCompletedSecret = "gcrunner-setup-completed"
+
+// setupCompleted reports whether setup has already finished (non-empty sentinel
+// version exists). NotFound on the secret or on its versions is treated as
+// "not completed yet" so the bootstrap path works on a fresh deployment.
+func setupCompleted(ctx context.Context) (bool, error) {
+	value, err := getSecret(ctx, setupCompletedSecret)
+	if err != nil {
+		if strings.Contains(err.Error(), "NotFound") {
+			return false, nil
+		}
+		return false, err
+	}
+	return value != "", nil
+}
+
 // generateState creates an HMAC-signed state token containing a timestamp.
 // The state is verified on callback to prevent CSRF without needing server-side storage.
 func generateState(setupToken string) (string, error) {
@@ -149,6 +169,18 @@ func verifyState(state, setupToken string) bool {
 
 func handleSetup(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
+
+	completed, err := setupCompleted(ctx)
+	if err != nil {
+		log.Printf("ERROR: could not check setup sentinel: %v", err)
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+	if completed {
+		log.Printf("Setup attempt blocked: setup already completed")
+		http.Error(w, "setup already completed", http.StatusGone)
+		return
+	}
 
 	// Validate setup token
 	setupToken, err := getSecret(ctx, "gcrunner-setup-token")
@@ -230,6 +262,18 @@ func handleSetup(w http.ResponseWriter, r *http.Request) {
 func handleSetupCallback(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
+	completed, err := setupCompleted(ctx)
+	if err != nil {
+		log.Printf("ERROR: could not check setup sentinel: %v", err)
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+	if completed {
+		log.Printf("Setup callback blocked: setup already completed")
+		http.Error(w, "setup already completed", http.StatusGone)
+		return
+	}
+
 	code := r.URL.Query().Get("code")
 	if code == "" {
 		http.Error(w, "missing code parameter", http.StatusBadRequest)
@@ -297,6 +341,16 @@ func handleSetupCallback(w http.ResponseWriter, r *http.Request) {
 		}
 		log.Printf("Wrote secret %s", name)
 	}
+
+	// Lock setup. After this, /setup and /setup/callback refuse further
+	// requests so a later holder of the setup token cannot clobber these
+	// credentials with their own GitHub App.
+	if err := writeSecret(ctx, setupCompletedSecret, time.Now().UTC().Format(time.RFC3339)); err != nil {
+		log.Printf("ERROR: failed to write setup-completed sentinel: %v", err)
+		http.Error(w, "credentials saved but setup-lock failed; see logs", http.StatusInternalServerError)
+		return
+	}
+	log.Printf("Setup locked")
 
 	installURL := fmt.Sprintf("%s/installations/new", app.HTMLURL)
 	w.Header().Set("Content-Type", "text/html")
