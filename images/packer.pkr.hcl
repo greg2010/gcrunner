@@ -187,6 +187,14 @@ build {
   }
 
   ###########################################################################
+  # gcrunner-specific: Google Cloud Ops Agent
+  ###########################################################################
+  provisioner "shell" {
+    execute_command = "sudo sh -c '{{ .Vars }} {{ .Path }}'"
+    script          = "scripts/gcrunner/install-ops-agent.sh"
+  }
+
+  ###########################################################################
   # Reboot (matches official)
   ###########################################################################
   provisioner "shell" {

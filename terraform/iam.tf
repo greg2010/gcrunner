@@ -80,3 +80,16 @@ resource "google_storage_bucket_iam_member" "runner_cache" {
   role   = "roles/storage.objectAdmin"
   member = "serviceAccount:${google_service_account.runner.email}"
 }
+
+# Runner SA: ship logs and metrics from the VM via the Ops Agent.
+resource "google_project_iam_member" "runner_log_writer" {
+  project = var.project_id
+  role    = "roles/logging.logWriter"
+  member  = "serviceAccount:${google_service_account.runner.email}"
+}
+
+resource "google_project_iam_member" "runner_metric_writer" {
+  project = var.project_id
+  role    = "roles/monitoring.metricWriter"
+  member  = "serviceAccount:${google_service_account.runner.email}"
+}
