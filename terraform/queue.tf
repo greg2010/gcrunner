@@ -3,7 +3,8 @@ resource "google_cloud_tasks_queue" "webhook" {
   location = var.region
 
   retry_config {
-    max_attempts       = 5
+    max_attempts       = -1
+    max_retry_duration = "86400s"
     min_backoff        = "5s"
     max_backoff        = "300s"
     max_doublings      = 4
