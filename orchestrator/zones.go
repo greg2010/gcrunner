@@ -3,6 +3,7 @@ package function
 import (
 	"context"
 	"fmt"
+	"log"
 	"sync"
 	"time"
 
@@ -12,12 +13,12 @@ import (
 	"google.golang.org/protobuf/proto"
 )
 
-// ZoneCache caches per-region zone lists with a TTL.
+// ZoneCache is safe for concurrent use.
 type ZoneCache struct {
 	mu      sync.RWMutex
 	zones   map[string]zoneCacheEntry
 	ttl     time.Duration
-	nowFunc func() time.Time // for testing
+	nowFunc func() time.Time
 }
 
 type zoneCacheEntry struct {
@@ -31,7 +32,7 @@ var zoneCache = &ZoneCache{
 	nowFunc: time.Now,
 }
 
-// ListZones returns the available (UP) zones for a region, using a cache.
+// ListZones returns cached UP zones or queries Compute Engine.
 func ListZones(ctx context.Context, project, region string) ([]string, error) {
 	return zoneCache.list(ctx, project, region)
 }
@@ -64,7 +65,11 @@ func fetchZones(ctx context.Context, project, region string) ([]string, error) {
 	if err != nil {
 		return nil, fmt.Errorf("create zones client: %w", err)
 	}
-	defer client.Close()
+	defer func() {
+		if err := client.Close(); err != nil {
+			log.Printf("WARN zones_client_close_failed error=%v", err)
+		}
+	}()
 
 	filter := fmt.Sprintf(`status = "UP" AND name : "%s-*"`, region)
 	it := client.List(ctx, &computepb.ListZonesRequest{

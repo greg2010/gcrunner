@@ -7,6 +7,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -14,7 +15,6 @@ import (
 	"os"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 
 	secretmanager "cloud.google.com/go/secretmanager/apiv1"
@@ -22,22 +22,48 @@ import (
 	"google.golang.org/api/idtoken"
 )
 
-var (
-	smClient     *secretmanager.Client
-	smClientOnce sync.Once
-	projectID    string
-)
+type secretManagerClientFactory interface {
+	NewClient(ctx context.Context) (*secretmanager.Client, error)
+}
 
-func getSecretManagerClient(ctx context.Context) (*secretmanager.Client, error) {
-	var initErr error
-	smClientOnce.Do(func() {
-		smClient, initErr = secretmanager.NewClient(ctx)
-		projectID = os.Getenv("GCP_PROJECT")
-		if projectID == "" {
-			projectID = os.Getenv("GOOGLE_CLOUD_PROJECT")
+type secretManagerClientFactoryImpl struct{}
+
+func (secretManagerClientFactoryImpl) NewClient(ctx context.Context) (*secretmanager.Client, error) {
+	return secretmanager.NewClient(ctx)
+}
+
+type secretManagerClientInitializer struct {
+	client  *retryingClientInitializer[*secretmanager.Client]
+	project string
+}
+
+func newSecretManagerClientInitializer(factory secretManagerClientFactory) *secretManagerClientInitializer {
+	return &secretManagerClientInitializer{client: newRetryingClientInitializer(factory.NewClient)}
+}
+
+func (i *secretManagerClientInitializer) get(ctx context.Context) (*secretmanager.Client, error) {
+	client, err := i.client.get(ctx, func(*secretmanager.Client) {
+		i.project = os.Getenv("GCP_PROJECT")
+		if i.project == "" {
+			i.project = os.Getenv("GOOGLE_CLOUD_PROJECT")
 		}
 	})
-	return smClient, initErr
+	if err != nil {
+		return nil, fmt.Errorf("create secret manager client: %w", err)
+	}
+	return client, nil
+}
+
+var secretManagerClient = newSecretManagerClientInitializer(secretManagerClientFactoryImpl{})
+
+func getSecretManagerClient(ctx context.Context) (*secretmanager.Client, error) {
+	return secretManagerClient.get(ctx)
+}
+
+func writeResponse(w http.ResponseWriter, endpoint, format string, args ...any) {
+	if _, err := fmt.Fprintf(w, format, args...); err != nil {
+		log.Printf("WARN response_write_failed endpoint=%s error=%v", endpoint, err)
+	}
 }
 
 func getSecret(ctx context.Context, name string) (string, error) {
@@ -47,7 +73,7 @@ func getSecret(ctx context.Context, name string) (string, error) {
 	}
 
 	result, err := client.AccessSecretVersion(ctx, &secretmanagerpb.AccessSecretVersionRequest{
-		Name: fmt.Sprintf("projects/%s/secrets/%s/versions/latest", projectID, name),
+		Name: fmt.Sprintf("projects/%s/secrets/%s/versions/latest", secretManagerClient.project, name),
 	})
 	if err != nil {
 		return "", fmt.Errorf("failed to access secret %s: %w", name, err)
@@ -56,18 +82,16 @@ func getSecret(ctx context.Context, name string) (string, error) {
 	return strings.TrimSpace(string(result.Payload.Data)), nil
 }
 
-// writeSecret creates a secret if it doesn't exist and adds a new version with the given value.
 func writeSecret(ctx context.Context, name, value string) error {
 	client, err := getSecretManagerClient(ctx)
 	if err != nil {
 		return fmt.Errorf("failed to create secret manager client: %w", err)
 	}
 
-	secretName := fmt.Sprintf("projects/%s/secrets/%s", projectID, name)
+	secretName := fmt.Sprintf("projects/%s/secrets/%s", secretManagerClient.project, name)
 
-	// Create secret if it doesn't exist
 	_, err = client.CreateSecret(ctx, &secretmanagerpb.CreateSecretRequest{
-		Parent:   fmt.Sprintf("projects/%s", projectID),
+		Parent:   fmt.Sprintf("projects/%s", secretManagerClient.project),
 		SecretId: name,
 		Secret: &secretmanagerpb.Secret{
 			Replication: &secretmanagerpb.Replication{
@@ -81,7 +105,6 @@ func writeSecret(ctx context.Context, name, value string) error {
 		return fmt.Errorf("failed to create secret %s: %w", name, err)
 	}
 
-	// Add new version
 	_, err = client.AddSecretVersion(ctx, &secretmanagerpb.AddSecretVersionRequest{
 		Parent: secretName,
 		Payload: &secretmanagerpb.SecretPayload{
@@ -95,8 +118,7 @@ func writeSecret(ctx context.Context, name, value string) error {
 	return nil
 }
 
-// HandleWebhook is the HTTP entry point that routes between
-// setup pages and webhook handling.
+// HandleWebhook serves setup and webhook requests.
 func HandleWebhook(w http.ResponseWriter, r *http.Request) {
 	switch {
 	case r.Method == http.MethodGet && r.URL.Path == "/setup":
@@ -108,15 +130,8 @@ func HandleWebhook(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// setupCompletedSecret is the sentinel: if it has a non-empty latest version,
-// /setup and /setup/callback refuse further requests. The orchestrator writes
-// this on the first successful callback so a later holder of the setup token
-// cannot pivot the orchestrator's GitHub App trust to an App they control.
 const setupCompletedSecret = "gcrunner-setup-completed"
 
-// setupCompleted reports whether setup has already finished (non-empty sentinel
-// version exists). NotFound on the secret or on its versions is treated as
-// "not completed yet" so the bootstrap path works on a fresh deployment.
 func setupCompleted(ctx context.Context) (bool, error) {
 	value, err := getSecret(ctx, setupCompletedSecret)
 	if err != nil {
@@ -128,8 +143,6 @@ func setupCompleted(ctx context.Context) (bool, error) {
 	return value != "", nil
 }
 
-// generateState creates an HMAC-signed state token containing a timestamp.
-// The state is verified on callback to prevent CSRF without needing server-side storage.
 func generateState(setupToken string) (string, error) {
 	nonce := make([]byte, 16)
 	if _, err := rand.Read(nonce); err != nil {
@@ -144,7 +157,6 @@ func generateState(setupToken string) (string, error) {
 	return payload + "." + sig, nil
 }
 
-// verifyState checks that a state token is valid and not expired (1 hour TTL).
 func verifyState(state, setupToken string) bool {
 	parts := strings.SplitN(state, ".", 3)
 	if len(parts) != 3 {
@@ -182,7 +194,6 @@ func handleSetup(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Validate setup token
 	setupToken, err := getSecret(ctx, "gcrunner-setup-token")
 	if err != nil || setupToken == "" {
 		log.Printf("ERROR: could not load setup token: %v", err)
@@ -195,7 +206,6 @@ func handleSetup(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Generate CSRF state parameter
 	state, err := generateState(setupToken)
 	if err != nil {
 		log.Printf("ERROR: could not generate state: %v", err)
@@ -228,7 +238,7 @@ func handleSetup(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.Header().Set("Content-Type", "text/html")
-	fmt.Fprintf(w, `<!DOCTYPE html>
+	writeResponse(w, r.URL.Path, `<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="utf-8">
@@ -280,7 +290,6 @@ func handleSetupCallback(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Verify CSRF state parameter
 	state := r.URL.Query().Get("state")
 	setupToken, err := getSecret(ctx, "gcrunner-setup-token")
 	if err != nil || setupToken == "" {
@@ -294,7 +303,6 @@ func handleSetupCallback(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Exchange the code for app credentials
 	resp, err := http.Post(
 		fmt.Sprintf("https://api.github.com/app-manifests/%s/conversions", code),
 		"application/json",
@@ -305,7 +313,11 @@ func handleSetupCallback(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "failed to contact GitHub API", http.StatusInternalServerError)
 		return
 	}
-	defer resp.Body.Close()
+	defer func() {
+		if err := resp.Body.Close(); err != nil {
+			log.Printf("WARN github_response_body_close_failed error=%v", err)
+		}
+	}()
 
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
@@ -327,11 +339,10 @@ func handleSetupCallback(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Write credentials to Secret Manager
 	secrets := map[string]string{
-		"gcrunner-app-id":          fmt.Sprintf("%d", app.ID),
-		"gcrunner-private-key":     app.PEM,
-		"gcrunner-webhook-secret":  app.WebhookSecret,
+		"gcrunner-app-id":         fmt.Sprintf("%d", app.ID),
+		"gcrunner-private-key":    app.PEM,
+		"gcrunner-webhook-secret": app.WebhookSecret,
 	}
 	for name, value := range secrets {
 		if err := writeSecret(ctx, name, value); err != nil {
@@ -342,9 +353,6 @@ func handleSetupCallback(w http.ResponseWriter, r *http.Request) {
 		log.Printf("Wrote secret %s", name)
 	}
 
-	// Lock setup. After this, /setup and /setup/callback refuse further
-	// requests so a later holder of the setup token cannot clobber these
-	// credentials with their own GitHub App.
 	if err := writeSecret(ctx, setupCompletedSecret, time.Now().UTC().Format(time.RFC3339)); err != nil {
 		log.Printf("ERROR: failed to write setup-completed sentinel: %v", err)
 		http.Error(w, "credentials saved but setup-lock failed; see logs", http.StatusInternalServerError)
@@ -354,7 +362,7 @@ func handleSetupCallback(w http.ResponseWriter, r *http.Request) {
 
 	installURL := fmt.Sprintf("%s/installations/new", app.HTMLURL)
 	w.Header().Set("Content-Type", "text/html")
-	fmt.Fprintf(w, `<!DOCTYPE html>
+	writeResponse(w, r.URL.Path, `<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="utf-8">
@@ -405,7 +413,6 @@ func handleWebhook(w http.ResponseWriter, r *http.Request) {
 
 	log.Printf("Received %s request from %s, event: %s", r.Method, r.RemoteAddr, r.Header.Get("X-GitHub-Event"))
 
-	// Verify HMAC signature using secret from Secret Manager
 	secret, err := getSecret(ctx, "gcrunner-webhook-secret")
 	if err != nil {
 		log.Printf("ERROR: could not load webhook secret: %v", err)
@@ -428,7 +435,7 @@ func handleWebhook(w http.ResponseWriter, r *http.Request) {
 	event := r.Header.Get("X-GitHub-Event")
 	if event != "workflow_job" {
 		w.WriteHeader(http.StatusOK)
-		fmt.Fprintf(w, "ok")
+		writeResponse(w, r.URL.Path, "ok")
 		return
 	}
 
@@ -445,13 +452,12 @@ func handleWebhook(w http.ResponseWriter, r *http.Request) {
 	case "completed":
 		taskPath = "/task/completed"
 	case "in_progress":
-		// no-op for MVP
 		w.WriteHeader(http.StatusOK)
-		fmt.Fprintf(w, "ok")
+		writeResponse(w, r.URL.Path, "ok")
 		return
 	default:
 		w.WriteHeader(http.StatusOK)
-		fmt.Fprintf(w, "ok")
+		writeResponse(w, r.URL.Path, "ok")
 		return
 	}
 
@@ -463,24 +469,78 @@ func handleWebhook(w http.ResponseWriter, r *http.Request) {
 
 	log.Printf("Enqueued %s task for job %d", payload.Action, payload.WorkflowJob.ID)
 	w.WriteHeader(http.StatusOK)
-	fmt.Fprintf(w, "ok")
+	writeResponse(w, r.URL.Path, "ok")
 }
 
-// taskTokenValidator validates an OIDC ID token against an audience and returns
-// the decoded payload. Package variable so tests can stub the network-dependent
-// google.golang.org/api/idtoken call without standing up Google's cert endpoint.
-var taskTokenValidator = func(ctx context.Context, token, audience string) (*idtoken.Payload, error) {
+type taskTokenValidator interface {
+	Validate(ctx context.Context, token, audience string) (*idtoken.Payload, error)
+}
+
+type installationCredentialsResolver interface {
+	GetInstallationCredentials(ctx context.Context, owner string) (installationCredentials, error)
+}
+
+type workflowJobStatusLookup interface {
+	GetWorkflowJobStatus(ctx context.Context, owner, repo string, jobID int64, credentials installationCredentials) (string, error)
+}
+
+type runnerVMCreator interface {
+	CreateRunnerVM(ctx context.Context, event WorkflowJobEvent, labels *RunnerLabels, credentials installationCredentials) error
+}
+
+type runnerVMDeleter interface {
+	DeleteRunnerVM(ctx context.Context, name string, labels *RunnerLabels) error
+}
+
+type idTokenValidator struct{}
+
+func (idTokenValidator) Validate(ctx context.Context, token, audience string) (*idtoken.Payload, error) {
 	return idtoken.Validate(ctx, token, audience)
 }
 
-// verifyTaskRequest authenticates a /task/* request by validating the OIDC ID
-// token Cloud Tasks attaches in the Authorization header. The token must be
-// issued by Google for the tasks service account (CLOUD_TASKS_SA_EMAIL) with
-// the audience set to this service's Cloud Run URL (CLOUD_RUN_URL).
-//
-// The Cloud Run service is publicly invokable (allUsers) for the GitHub webhook
-// path, so /task/* cannot rely on IAM and must authenticate the token itself.
-func verifyTaskRequest(ctx context.Context, r *http.Request) error {
+type githubInstallationCredentialsResolver struct{}
+
+func (githubInstallationCredentialsResolver) GetInstallationCredentials(ctx context.Context, owner string) (installationCredentials, error) {
+	return githubAPIClient.getInstallationCredentials(ctx, owner)
+}
+
+type githubWorkflowJobStatusLookup struct{}
+
+func (githubWorkflowJobStatusLookup) GetWorkflowJobStatus(ctx context.Context, owner, repo string, jobID int64, credentials installationCredentials) (string, error) {
+	return githubAPIClient.getWorkflowJobStatus(ctx, owner, repo, jobID, credentials)
+}
+
+type gceRunnerVMCreator struct{}
+
+func (gceRunnerVMCreator) CreateRunnerVM(ctx context.Context, event WorkflowJobEvent, labels *RunnerLabels, credentials installationCredentials) error {
+	return createRunnerVM(ctx, event, labels, credentials)
+}
+
+type gceRunnerVMDeleter struct{}
+
+func (gceRunnerVMDeleter) DeleteRunnerVM(ctx context.Context, name string, labels *RunnerLabels) error {
+	return deleteRunnerVM(ctx, name, labels)
+}
+
+type taskHandler struct {
+	tokenValidator      taskTokenValidator
+	credentialsResolver installationCredentialsResolver
+	statusLookup        workflowJobStatusLookup
+	vmCreator           runnerVMCreator
+	vmDeleter           runnerVMDeleter
+}
+
+func newTaskHandler(tokenValidator taskTokenValidator, credentialsResolver installationCredentialsResolver, statusLookup workflowJobStatusLookup, vmCreator runnerVMCreator, vmDeleter runnerVMDeleter) *taskHandler {
+	return &taskHandler{
+		tokenValidator:      tokenValidator,
+		credentialsResolver: credentialsResolver,
+		statusLookup:        statusLookup,
+		vmCreator:           vmCreator,
+		vmDeleter:           vmDeleter,
+	}
+}
+
+func verifyTaskRequest(ctx context.Context, r *http.Request, tokenValidator taskTokenValidator) error {
 	const prefix = "Bearer "
 	auth := r.Header.Get("Authorization")
 	if !strings.HasPrefix(auth, prefix) {
@@ -497,7 +557,7 @@ func verifyTaskRequest(ctx context.Context, r *http.Request) error {
 		return fmt.Errorf("CLOUD_TASKS_SA_EMAIL not set")
 	}
 
-	payload, err := taskTokenValidator(ctx, token, audience)
+	payload, err := tokenValidator.Validate(ctx, token, audience)
 	if err != nil {
 		return fmt.Errorf("validate id token: %w", err)
 	}
@@ -513,11 +573,12 @@ func verifyTaskRequest(ctx context.Context, r *http.Request) error {
 	return nil
 }
 
-// HandleTask handles requests from Cloud Tasks at /task/* paths. The Cloud Run
-// service grants roles/run.invoker to allUsers (for GitHub webhooks), so this
-// handler must authenticate inbound requests itself via the OIDC token Cloud
-// Tasks attaches.
+// HandleTask serves authenticated Cloud Tasks requests.
 func HandleTask(w http.ResponseWriter, r *http.Request) {
+	newTaskHandler(idTokenValidator{}, githubInstallationCredentialsResolver{}, githubWorkflowJobStatusLookup{}, gceRunnerVMCreator{}, gceRunnerVMDeleter{}).ServeHTTP(w, r)
+}
+
+func (h *taskHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
 	if r.Method != http.MethodPost {
@@ -525,7 +586,7 @@ func HandleTask(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := verifyTaskRequest(ctx, r); err != nil {
+	if err := verifyTaskRequest(ctx, r, h.tokenValidator); err != nil {
 		log.Printf("Task auth failed: %v", err)
 		http.Error(w, "unauthorized", http.StatusUnauthorized)
 		return
@@ -548,13 +609,17 @@ func HandleTask(w http.ResponseWriter, r *http.Request) {
 
 	switch r.URL.Path {
 	case "/task/queued":
-		if err := handleQueued(ctx, payload); err != nil {
+		if err := h.handleQueued(ctx, payload); err != nil {
+			if isFatalVMCreationError(err) {
+				log.Printf("ERROR fatal_vm_creation_error job_id=%d repo=%s error=%v", payload.WorkflowJob.ID, payload.Repository.FullName, err)
+				break
+			}
 			log.Printf("ERROR handling queued task: %v", err)
 			http.Error(w, "internal error", http.StatusInternalServerError)
 			return
 		}
 	case "/task/completed":
-		if err := handleCompleted(ctx, payload); err != nil {
+		if err := h.handleCompleted(ctx, payload); err != nil {
 			log.Printf("ERROR handling completed task: %v", err)
 			http.Error(w, "internal error", http.StatusInternalServerError)
 			return
@@ -565,49 +630,60 @@ func HandleTask(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.WriteHeader(http.StatusOK)
-	fmt.Fprintf(w, "ok")
+	writeResponse(w, r.URL.Path, "ok")
 }
 
-func handleQueued(ctx context.Context, event WorkflowJobEvent) error {
+func (h *taskHandler) handleQueued(ctx context.Context, event WorkflowJobEvent) error {
 	labels := parseLabels(event.WorkflowJob.Labels)
 	if labels == nil {
 		log.Printf("Job %d: not a gcrunner job, skipping", event.WorkflowJob.ID)
 		return nil
 	}
+	if err := validateRunnerVMPreflight(labels); err != nil {
+		return err
+	}
+
+	owner := event.Repository.Owner.Login
+	credentials, err := h.credentialsResolver.GetInstallationCredentials(ctx, owner)
+	if err != nil {
+		return fmt.Errorf("get installation credentials: %w", err)
+	}
+
+	status, err := h.statusLookup.GetWorkflowJobStatus(ctx, owner, event.Repository.Name, event.WorkflowJob.ID, credentials)
+	if err != nil {
+		if errors.Is(err, errWorkflowJobNotFound) {
+			log.Printf("INFO stale_job_skipped job_id=%d repo=%s status=not_found", event.WorkflowJob.ID, event.Repository.FullName)
+			return nil
+		}
+		log.Printf("WARN job_status_lookup_failed job_id=%d repo=%s error=%v", event.WorkflowJob.ID, event.Repository.FullName, err)
+	} else if status == "" {
+		log.Printf("WARN job_status_empty job_id=%d repo=%s", event.WorkflowJob.ID, event.Repository.FullName)
+	} else if status != "queued" {
+		log.Printf("INFO stale_job_skipped job_id=%d repo=%s status=%s", event.WorkflowJob.ID, event.Repository.FullName, status)
+		return nil
+	}
 
 	log.Printf("Job %d: creating VM with labels %+v", event.WorkflowJob.ID, labels)
-	return createRunnerVM(ctx, event, labels)
+	return h.vmCreator.CreateRunnerVM(ctx, event, labels, credentials)
 }
 
-// vmDeleter is the function used to delete a VM. Replaceable in tests.
-var vmDeleter = deleteRunnerVM
-
-func handleCompleted(ctx context.Context, event WorkflowJobEvent) error {
+func (h *taskHandler) handleCompleted(ctx context.Context, event WorkflowJobEvent) error {
 	labels := parseLabels(event.WorkflowJob.Labels)
 	if labels == nil {
 		return nil
 	}
 
-	// GitHub records the actual runner that picked up the job in
-	// workflow_job.runner_name. Because the JIT registration in
-	// createRunnerVM uses the VM's instance name as the runner name, that
-	// field is the authoritative VM to delete — even when GitHub's
-	// label-based dispatch hands the job to a runner the orchestrator
-	// originally created for a different job. Reconstructing the name
-	// from job_id alone can delete a VM running an unrelated workload.
 	name := event.WorkflowJob.RunnerName
 	if name == "" {
-		// runner_name is empty when the job is cancelled or otherwise
-		// completed before any runner picked it up. In that case the
-		// reconstructed name still matches what createRunnerVM produced.
 		name = fmt.Sprintf("gcrunner-%d-%d", event.WorkflowJob.RunID, event.WorkflowJob.ID)
 		log.Printf("Job %d: completed with empty runner_name, falling back to %s", event.WorkflowJob.ID, name)
 	}
 	if !strings.HasPrefix(name, "gcrunner-") {
-		return fmt.Errorf("refusing to delete VM with unexpected name: %q", name)
+		log.Printf("INFO foreign_runner_name_skipped job_id=%d runner_name=%s", event.WorkflowJob.ID, name)
+		return nil
 	}
 	log.Printf("Job %d: completed, deleting VM %s", event.WorkflowJob.ID, name)
-	return vmDeleter(ctx, name)
+	return h.vmDeleter.DeleteRunnerVM(ctx, name, labels)
 }
 
 func verifySignature(payload []byte, signature, secret string) bool {
@@ -624,7 +700,7 @@ func verifySignature(payload []byte, signature, secret string) bool {
 	return hmac.Equal(sig, expected)
 }
 
-// WorkflowJobEvent represents a GitHub workflow_job webhook payload.
+// WorkflowJobEvent is the subset of a workflow_job webhook used to manage runners.
 type WorkflowJobEvent struct {
 	Action      string      `json:"action"`
 	WorkflowJob WorkflowJob `json:"workflow_job"`
@@ -639,16 +715,16 @@ type WorkflowJob struct {
 }
 
 type Repository struct {
-	FullName string         `json:"full_name"`
+	FullName string          `json:"full_name"`
 	Owner    RepositoryOwner `json:"owner"`
-	Name     string         `json:"name"`
+	Name     string          `json:"name"`
 }
 
 type RepositoryOwner struct {
 	Login string `json:"login"`
 }
 
-// GitHubAppManifest is the manifest sent to GitHub to create a new App.
+// GitHubAppManifest defines the permissions and webhook events requested during App creation.
 type GitHubAppManifest struct {
 	Name               string            `json:"name"`
 	URL                string            `json:"url"`
@@ -659,7 +735,7 @@ type GitHubAppManifest struct {
 	DefaultEvents      []string          `json:"default_events"`
 }
 
-// GitHubAppResponse is the response from the manifest conversion endpoint.
+// GitHubAppResponse contains credentials returned by GitHub's manifest conversion endpoint.
 type GitHubAppResponse struct {
 	ID            int    `json:"id"`
 	Slug          string `json:"slug"`

@@ -11,7 +11,7 @@ import (
 	"runtime"
 )
 
-// GitHubAppManifest is the manifest sent to GitHub to create a new App.
+// GitHubAppManifest defines the permissions and webhook events requested during App creation.
 type GitHubAppManifest struct {
 	Name               string            `json:"name"`
 	URL                string            `json:"url"`
@@ -22,7 +22,7 @@ type GitHubAppManifest struct {
 	DefaultEvents      []string          `json:"default_events"`
 }
 
-// GitHubAppResponse is the response from the manifest conversion endpoint.
+// GitHubAppResponse contains credentials returned by GitHub's manifest conversion endpoint.
 type GitHubAppResponse struct {
 	ID            int    `json:"id"`
 	Slug          string `json:"slug"`
@@ -34,6 +34,12 @@ type GitHubAppResponse struct {
 	HTMLURL       string `json:"html_url"`
 }
 
+func writeResponse(w http.ResponseWriter, endpoint, format string, args ...any) {
+	if _, err := fmt.Fprintf(w, format, args...); err != nil {
+		log.Printf("WARN response_write_failed endpoint=%s error=%v", endpoint, err)
+	}
+}
+
 func main() {
 	port := "3456"
 	callbackPath := "/callback"
@@ -43,7 +49,7 @@ func main() {
 		Name: "gcrunner",
 		URL:  "https://github.com/camdenclark/gcrunner",
 		HookAttributes: map[string]string{
-			"url": "https://example.com/webhook", // placeholder, updated after deploy
+			"url": "https://example.com/webhook",
 		},
 		RedirectURL: redirectURL,
 		Public:      false,
@@ -61,10 +67,9 @@ func main() {
 
 	mux := http.NewServeMux()
 
-	// Serve the form page that redirects to GitHub
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/html")
-		fmt.Fprintf(w, `<!DOCTYPE html>
+		writeResponse(w, r.URL.Path, `<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="utf-8">
@@ -94,7 +99,6 @@ func main() {
 </html>`, string(manifestJSON))
 	})
 
-	// Handle the callback from GitHub after app creation
 	mux.HandleFunc(callbackPath, func(w http.ResponseWriter, r *http.Request) {
 		code := r.URL.Query().Get("code")
 		if code == "" {
@@ -102,7 +106,6 @@ func main() {
 			return
 		}
 
-		// Exchange the code for the app credentials
 		resp, err := http.Post(
 			fmt.Sprintf("https://api.github.com/app-manifests/%s/conversions", code),
 			"application/json",
@@ -112,7 +115,11 @@ func main() {
 			http.Error(w, fmt.Sprintf("GitHub API error: %v", err), http.StatusInternalServerError)
 			return
 		}
-		defer resp.Body.Close()
+		defer func() {
+			if err := resp.Body.Close(); err != nil {
+				log.Printf("WARN github_response_body_close_failed error=%v", err)
+			}
+		}()
 
 		body, err := io.ReadAll(resp.Body)
 		if err != nil {
@@ -131,7 +138,6 @@ func main() {
 			return
 		}
 
-		// Save credentials to .env file
 		envContent := fmt.Sprintf(
 			"GITHUB_APP_ID=%d\nGITHUB_APP_SLUG=%s\nGITHUB_CLIENT_ID=%s\nGITHUB_CLIENT_SECRET=%s\nGITHUB_WEBHOOK_SECRET=%s\n",
 			app.ID, app.Slug, app.ClientID, app.ClientSecret, app.WebhookSecret,
@@ -140,13 +146,12 @@ func main() {
 			log.Printf("Failed to write .env: %v", err)
 		}
 
-		// Save private key
 		if err := os.WriteFile("private-key.pem", []byte(app.PEM), 0600); err != nil {
 			log.Printf("Failed to write private-key.pem: %v", err)
 		}
 
 		w.Header().Set("Content-Type", "text/html")
-		fmt.Fprintf(w, `<!DOCTYPE html>
+		writeResponse(w, r.URL.Path, `<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="utf-8">
@@ -187,7 +192,6 @@ func main() {
 	url := fmt.Sprintf("http://localhost:%s", port)
 	log.Printf("Opening %s — create your GitHub App there.", url)
 
-	// Open browser
 	go func() {
 		var cmd *exec.Cmd
 		switch runtime.GOOS {
@@ -199,7 +203,9 @@ func main() {
 			log.Printf("Please open %s in your browser", url)
 			return
 		}
-		cmd.Run()
+		if err := cmd.Run(); err != nil {
+			log.Printf("WARN browser_open_failed url=%s error=%v", url, err)
+		}
 	}()
 
 	log.Fatal(http.ListenAndServe(":"+port, mux))

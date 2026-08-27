@@ -5,32 +5,47 @@ import (
 	"fmt"
 	"os"
 	"strings"
-	"sync"
 
 	cloudtasks "cloud.google.com/go/cloudtasks/apiv2"
 	taskspb "cloud.google.com/go/cloudtasks/apiv2/cloudtaskspb"
 )
 
-var (
-	ctClient     *cloudtasks.Client
-	ctClientOnce sync.Once
-)
-
-func getCloudTasksClient(ctx context.Context) (*cloudtasks.Client, error) {
-	var initErr error
-	ctClientOnce.Do(func() {
-		ctClient, initErr = cloudtasks.NewClient(ctx)
-	})
-	return ctClient, initErr
+type cloudTasksClientFactory interface {
+	NewClient(ctx context.Context) (*cloudtasks.Client, error)
 }
 
-// enqueueTask creates a Cloud Tasks HTTP task targeting the Cloud Run service.
-// The task name is derived from the jobID to provide deduplication — if GitHub
-// retries a webhook, the same task name prevents double-enqueue.
+type cloudTasksClientFactoryImpl struct{}
+
+func (cloudTasksClientFactoryImpl) NewClient(ctx context.Context) (*cloudtasks.Client, error) {
+	return cloudtasks.NewClient(ctx)
+}
+
+type cloudTasksClientInitializer struct {
+	client *retryingClientInitializer[*cloudtasks.Client]
+}
+
+func newCloudTasksClientInitializer(factory cloudTasksClientFactory) *cloudTasksClientInitializer {
+	return &cloudTasksClientInitializer{client: newRetryingClientInitializer(factory.NewClient)}
+}
+
+func (i *cloudTasksClientInitializer) get(ctx context.Context) (*cloudtasks.Client, error) {
+	client, err := i.client.get(ctx, func(*cloudtasks.Client) {})
+	if err != nil {
+		return nil, fmt.Errorf("create cloud tasks client: %w", err)
+	}
+	return client, nil
+}
+
+var cloudTasksClient = newCloudTasksClientInitializer(cloudTasksClientFactoryImpl{})
+
+func getCloudTasksClient(ctx context.Context) (*cloudtasks.Client, error) {
+	return cloudTasksClient.get(ctx)
+}
+
 func enqueueTask(ctx context.Context, path string, payload []byte, jobID int64) error {
 	client, err := getCloudTasksClient(ctx)
 	if err != nil {
-		return fmt.Errorf("create cloud tasks client: %w", err)
+		return err
 	}
 
 	queuePath := os.Getenv("CLOUD_TASKS_QUEUE")
@@ -48,8 +63,6 @@ func enqueueTask(ctx context.Context, path string, payload []byte, jobID int64) 
 		return fmt.Errorf("CLOUD_TASKS_SA_EMAIL environment variable not set")
 	}
 
-	// Task IDs may only contain letters, numbers, hyphens, underscores.
-	// Convert path like "/task/queued" → "queued" for the suffix.
 	pathSuffix := path[strings.LastIndex(path, "/")+1:]
 	taskName := fmt.Sprintf("%s/tasks/job-%d-%s", queuePath, jobID, pathSuffix)
 
@@ -68,11 +81,7 @@ func enqueueTask(ctx context.Context, path string, payload []byte, jobID int64) 
 					AuthorizationHeader: &taskspb.HttpRequest_OidcToken{
 						OidcToken: &taskspb.OidcToken{
 							ServiceAccountEmail: tasksSAEmail,
-							// Pin the audience to the bare Cloud Run service URL.
-							// Cloud Tasks otherwise defaults to the full request
-							// URL (cloudRunURL+path) as the aud claim, which would
-							// not match the audience the receiver checks against.
-							Audience: cloudRunURL,
+							Audience:            cloudRunURL,
 						},
 					},
 				},

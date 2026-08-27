@@ -3,6 +3,7 @@ package function
 import (
 	"context"
 	"fmt"
+	"log"
 	"strconv"
 	"strings"
 	"sync"
@@ -13,16 +14,16 @@ import (
 	"google.golang.org/api/iterator"
 )
 
-// MachineTypeInfo holds parsed information about a GCE machine type.
+// MachineTypeInfo records the resource values Google Compute Engine reports for a machine type.
 type MachineTypeInfo struct {
-	Name     string // e.g. "n2d-standard-4"
-	Family   string // e.g. "n2d"
-	Category string // e.g. "standard"
+	Name     string
+	Family   string
+	Category string
 	VCPUs    int32
 	MemoryMB int32
 }
 
-// MachineTypeCache caches per-zone machine type lists with a TTL.
+// MachineTypeCache is safe for concurrent use.
 type MachineTypeCache struct {
 	mu      sync.RWMutex
 	types   map[string]machineTypeCacheEntry
@@ -41,7 +42,7 @@ var machineTypeCache = &MachineTypeCache{
 	nowFunc: time.Now,
 }
 
-// ListMachineTypes returns machine types available in a zone, using a cache.
+// ListMachineTypes returns cached machine types for a zone or queries Compute Engine.
 func ListMachineTypes(ctx context.Context, project, zone string) ([]*MachineTypeInfo, error) {
 	return machineTypeCache.list(ctx, project, zone)
 }
@@ -74,7 +75,11 @@ func fetchMachineTypes(ctx context.Context, project, zone string) ([]*MachineTyp
 	if err != nil {
 		return nil, fmt.Errorf("create machine types client: %w", err)
 	}
-	defer client.Close()
+	defer func() {
+		if err := client.Close(); err != nil {
+			log.Printf("WARN machine_types_client_close_failed error=%v", err)
+		}
+	}()
 
 	it := client.List(ctx, &computepb.ListMachineTypesRequest{
 		Project: project,
@@ -103,9 +108,8 @@ func fetchMachineTypes(ctx context.Context, project, zone string) ([]*MachineTyp
 	return types, nil
 }
 
-// ResolveMachineType resolves a machine type string for a given zone based on labels.
-// In exact mode, returns the machine as-is. In family or auto mode, queries available
-// machine types and picks the smallest one satisfying the constraints.
+// ResolveMachineType selects the smallest supported type that satisfies labels.
+// It returns a fatal creation error when labels are invalid or no type matches.
 func ResolveMachineType(ctx context.Context, project, zone string, labels *RunnerLabels) (string, error) {
 	if labels.MachineMode == "exact" {
 		return labels.Machine, nil
@@ -122,19 +126,26 @@ func ResolveMachineType(ctx context.Context, project, zone string, labels *Runne
 	}
 	families := strings.Split(family, "+")
 
-	minCPU, maxCPU := parseRange(labels.CPU)
-	minRAM, maxRAM := parseRange(labels.RAM)
+	minCPU, maxCPU, err := parseRange(labels.CPU)
+	if err != nil {
+		return "", &vmCreationError{kind: insertErrorFatal, err: fmt.Errorf("parse cpu label: %w", err)}
+	}
+	minRAM, maxRAM, err := parseRange(labels.RAM)
+	if err != nil {
+		return "", &vmCreationError{kind: insertErrorFatal, err: fmt.Errorf("parse ram label: %w", err)}
+	}
 
 	var best *MachineTypeInfo
 	for _, mt := range types {
 		if !matchesFamily(mt, families) {
 			continue
 		}
-		// Skip shared-core types that don't have meaningful vCPU counts
+		if labels.KVM && kvmUnsupportedFamilies[mt.Family] {
+			continue
+		}
 		if isSharedCoreCategory(mt.Category) {
 			continue
 		}
-		// Skip GPU-oriented categories — users wanting GPUs should use exact types
 		if isGPUCategory(mt.Category) {
 			continue
 		}
@@ -157,29 +168,22 @@ func ResolveMachineType(ctx context.Context, project, zone string, labels *Runne
 	}
 
 	if best == nil {
-		return "", fmt.Errorf("no machine type matching constraints (families=%v, cpu=%s, ram=%s) in zone %s",
-			families, labels.CPU, labels.RAM, zone)
+		return "", &vmCreationError{
+			kind: insertErrorNoMachineType,
+			err: fmt.Errorf("no machine type matching constraints (families=%v, cpu=%s, ram=%s) in zone %s",
+				families, labels.CPU, labels.RAM, zone),
+		}
 	}
 
 	return best.Name, nil
 }
 
-// parseMachineFamily extracts the series/family from a machine type name.
-// Examples:
-//
-//	"n2d-standard-4"       → "n2d", "standard"
-//	"e2-micro"             → "e2", "micro"
-//	"c3-standard-88-lssd"  → "c3", "standard"
-//	"a2-highgpu-8g"        → "a2", "highgpu"
-//	"custom-6-23040"       → "n1", "custom"    (legacy N1 custom format)
-//	"n2d"                  → "n2d", ""
 func parseMachineFamily(name string) (family, category string) {
 	parts := strings.Split(name, "-")
 	if len(parts) < 2 {
 		return name, ""
 	}
 
-	// Handle legacy N1 custom types: "custom-6-23040"
 	if parts[0] == "custom" {
 		return "n1", "custom"
 	}
@@ -198,9 +202,6 @@ func matchesFamily(mt *MachineTypeInfo, families []string) bool {
 	return false
 }
 
-// isSharedCoreCategory returns true for categories that represent shared-core
-// machine types (e.g. e2-micro, f1-micro, g1-small) which have fractional vCPUs
-// and shouldn't be matched by cpu/ram constraints.
 func isSharedCoreCategory(category string) bool {
 	switch category {
 	case "micro", "small", "medium":
@@ -209,8 +210,6 @@ func isSharedCoreCategory(category string) bool {
 	return false
 }
 
-// isGPUCategory returns true for accelerator-optimized categories.
-// Users wanting GPU machines should specify exact machine types.
 func isGPUCategory(category string) bool {
 	switch category {
 	case "highgpu", "megagpu", "ultragpu", "edgegpu", "maxgpu":
@@ -219,17 +218,28 @@ func isGPUCategory(category string) bool {
 	return false
 }
 
-// parseRange parses "4" into (4, 4) or "2+8" into (2, 8) or "" into (0, 0).
-func parseRange(s string) (min, max int) {
+func parseRange(s string) (min, max int, err error) {
 	if s == "" {
-		return 0, 0
+		return 0, 0, nil
 	}
-	if strings.Contains(s, "+") {
-		parts := strings.SplitN(s, "+", 2)
-		min, _ = strconv.Atoi(parts[0])
-		max, _ = strconv.Atoi(parts[1])
-		return
+
+	parts := strings.Split(s, "+")
+	if len(parts) > 2 {
+		return 0, 0, fmt.Errorf("invalid range %q", s)
 	}
-	v, _ := strconv.Atoi(s)
-	return v, v
+	min, err = strconv.Atoi(parts[0])
+	if err != nil || min <= 0 {
+		return 0, 0, fmt.Errorf("invalid range minimum %q", parts[0])
+	}
+	max = min
+	if len(parts) == 2 {
+		max, err = strconv.Atoi(parts[1])
+		if err != nil || max <= 0 {
+			return 0, 0, fmt.Errorf("invalid range maximum %q", parts[1])
+		}
+	}
+	if min > max {
+		return 0, 0, fmt.Errorf("range minimum %d exceeds maximum %d", min, max)
+	}
+	return min, max, nil
 }

@@ -1,6 +1,10 @@
 package function
 
-import "testing"
+import (
+	"context"
+	"errors"
+	"testing"
+)
 
 func TestParseMachineFamily(t *testing.T) {
 	tests := []struct {
@@ -8,28 +12,21 @@ func TestParseMachineFamily(t *testing.T) {
 		wantFamily   string
 		wantCategory string
 	}{
-		// Standard cases
 		{"n2d-standard-4", "n2d", "standard"},
 		{"n2-highcpu-16", "n2", "highcpu"},
 		{"c3-standard-88-lssd", "c3", "standard"},
 		{"c3-standard-176-metal", "c3", "standard"},
-		// Shared-core
 		{"e2-micro", "e2", "micro"},
 		{"f1-micro", "f1", "micro"},
 		{"g1-small", "g1", "small"},
-		// Memory-optimized
 		{"m1-megamem-96", "m1", "megamem"},
 		{"m2-ultramem-208", "m2", "ultramem"},
 		{"m4-hypermem-112", "m4", "hypermem"},
-		// GPU
 		{"a2-highgpu-8g", "a2", "highgpu"},
-		// Custom types
 		{"n2-custom-8-32768", "n2", "custom"},
 		{"n2-custom-8-32768-ext", "n2", "custom"},
 		{"custom-6-23040", "n1", "custom"},
-		// X4 unusual format (family is x4, "category" is the vcpu count string)
 		{"x4-480-8t-metal", "x4", "480"},
-		// Bare series
 		{"n2d", "n2d", ""},
 	}
 	for _, tt := range tests {
@@ -43,21 +40,30 @@ func TestParseMachineFamily(t *testing.T) {
 
 func TestParseRange(t *testing.T) {
 	tests := []struct {
+		name    string
 		input   string
 		wantMin int
 		wantMax int
+		wantErr bool
 	}{
-		{"", 0, 0},
-		{"4", 4, 4},
-		{"2+8", 2, 8},
-		{"16+32", 16, 32},
+		{name: "empty", input: ""},
+		{name: "single value", input: "4", wantMin: 4, wantMax: 4},
+		{name: "range", input: "2+8", wantMin: 2, wantMax: 8},
+		{name: "large range", input: "16+32", wantMin: 16, wantMax: 32},
+		{name: "non numeric", input: "bogus", wantErr: true},
+		{name: "missing range maximum", input: "2+", wantErr: true},
+		{name: "inverted range", input: "8+2", wantErr: true},
 	}
 	for _, tt := range tests {
-		min, max := parseRange(tt.input)
-		if min != tt.wantMin || max != tt.wantMax {
-			t.Errorf("parseRange(%q) = (%d, %d), want (%d, %d)",
-				tt.input, min, max, tt.wantMin, tt.wantMax)
-		}
+		t.Run(tt.name, func(t *testing.T) {
+			min, max, err := parseRange(tt.input)
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("parseRange(%q) error = %v, wantErr = %t", tt.input, err, tt.wantErr)
+			}
+			if min != tt.wantMin || max != tt.wantMax {
+				t.Errorf("parseRange(%q) = (%d, %d), want (%d, %d)", tt.input, min, max, tt.wantMin, tt.wantMax)
+			}
+		})
 	}
 }
 
@@ -97,7 +103,6 @@ func TestIsGPUCategory(t *testing.T) {
 	}
 }
 
-// TestResolveMachineType_ExactMode tests that exact mode returns machine as-is.
 func TestResolveMachineType_ExactMode(t *testing.T) {
 	labels := &RunnerLabels{
 		Machine:     "n2d-standard-4",
@@ -112,7 +117,84 @@ func TestResolveMachineType_ExactMode(t *testing.T) {
 	}
 }
 
-// TestFilterLogic_SkipsSharedCore verifies shared-core types are excluded from resolution.
+func TestResolveMachineType_KVMFamilyFilter(t *testing.T) {
+	tests := []struct {
+		name     string
+		kvm      bool
+		types    []*MachineTypeInfo
+		wantType string
+		wantKind insertErrorKind
+	}{
+		{
+			name: "selects supported family when same-sized unsupported family is first",
+			kvm:  true,
+			types: []*MachineTypeInfo{
+				{Name: "e2-standard-4", Family: "e2", Category: "standard", VCPUs: 4, MemoryMB: 16384},
+				{Name: "n2d-standard-4", Family: "n2d", Category: "standard", VCPUs: 4, MemoryMB: 16384},
+			},
+			wantType: "n2d-standard-4",
+		},
+		{
+			name: "returns no candidate error when all families are unsupported",
+			kvm:  true,
+			types: []*MachineTypeInfo{
+				{Name: "e2-standard-4", Family: "e2", Category: "standard", VCPUs: 4, MemoryMB: 16384},
+				{Name: "t2d-standard-4", Family: "t2d", Category: "standard", VCPUs: 4, MemoryMB: 16384},
+			},
+			wantKind: insertErrorNoMachineType,
+		},
+		{
+			name: "does not filter unsupported family when kvm is disabled",
+			types: []*MachineTypeInfo{
+				{Name: "e2-standard-4", Family: "e2", Category: "standard", VCPUs: 4, MemoryMB: 16384},
+				{Name: "n2d-standard-4", Family: "n2d", Category: "standard", VCPUs: 4, MemoryMB: 16384},
+			},
+			wantType: "e2-standard-4",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			const zone = "test-zone"
+			machineTypeCache.mu.Lock()
+			previous, hadPrevious := machineTypeCache.types[zone]
+			machineTypeCache.types[zone] = machineTypeCacheEntry{types: tt.types, fetchedAt: machineTypeCache.nowFunc()}
+			machineTypeCache.mu.Unlock()
+			t.Cleanup(func() {
+				machineTypeCache.mu.Lock()
+				defer machineTypeCache.mu.Unlock()
+				if hadPrevious {
+					machineTypeCache.types[zone] = previous
+					return
+				}
+				delete(machineTypeCache.types, zone)
+			})
+
+			resolved, err := ResolveMachineType(context.Background(), "project", zone, &RunnerLabels{
+				Family:      "e2+n2d+t2d",
+				MachineMode: "family",
+				KVM:         tt.kvm,
+			})
+			if tt.wantKind != insertErrorRetryable {
+				var creationErr *vmCreationError
+				if !errors.As(err, &creationErr) {
+					t.Fatalf("ResolveMachineType() error = %v, want vmCreationError", err)
+				}
+				if creationErr.kind != tt.wantKind {
+					t.Errorf("ResolveMachineType() error kind = %d, want %d", creationErr.kind, tt.wantKind)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("ResolveMachineType() error = %v", err)
+			}
+			if resolved != tt.wantType {
+				t.Errorf("ResolveMachineType() = %q, want %q", resolved, tt.wantType)
+			}
+		})
+	}
+}
+
 func TestFilterLogic_SkipsSharedCore(t *testing.T) {
 	types := []*MachineTypeInfo{
 		{Name: "e2-micro", Family: "e2", Category: "micro", VCPUs: 2, MemoryMB: 1024},
@@ -140,7 +222,6 @@ func TestFilterLogic_SkipsSharedCore(t *testing.T) {
 	}
 }
 
-// TestFilterLogic_SkipsGPU verifies GPU types are excluded from resolution.
 func TestFilterLogic_SkipsGPU(t *testing.T) {
 	types := []*MachineTypeInfo{
 		{Name: "a2-highgpu-1g", Family: "a2", Category: "highgpu", VCPUs: 12, MemoryMB: 87040},
@@ -159,7 +240,6 @@ func TestFilterLogic_SkipsGPU(t *testing.T) {
 	}
 }
 
-// TestFilterLogic_IncludesMemoryOptimizedCategories ensures megamem/ultramem/hypermem pass filters.
 func TestFilterLogic_IncludesMemoryOptimizedCategories(t *testing.T) {
 	types := []*MachineTypeInfo{
 		{Name: "m1-megamem-96", Family: "m1", Category: "megamem", VCPUs: 96, MemoryMB: 1433600},
@@ -204,7 +284,6 @@ func TestFilterMachineTypes_CPUConstraint(t *testing.T) {
 	if best == nil {
 		t.Fatal("expected a match, got nil")
 	}
-	// Should pick n2d-highcpu-4 as smallest (4 vCPUs, less RAM than standard-4)
 	if best.Name != "n2d-highcpu-4" {
 		t.Errorf("best = %q, want %q", best.Name, "n2d-highcpu-4")
 	}
