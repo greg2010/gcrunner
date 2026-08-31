@@ -21,8 +21,10 @@ fi
 export PIPX_BIN_DIR=/opt/pipx_bin
 export PIPX_HOME=/opt/pipx
 
-python3 -m pip install pipx
-python3 -m pipx ensurepath
+# pipx gets its own venv so its dependencies never collide with apt-owned dist-packages.
+python3 -m venv /opt/pipx-venv
+/opt/pipx-venv/bin/pip install pipx
+ln -sf /opt/pipx-venv/bin/pipx /usr/local/bin/pipx
 
 set_etc_environment_variable "PIPX_BIN_DIR" $PIPX_BIN_DIR
 set_etc_environment_variable "PIPX_HOME" $PIPX_HOME
