@@ -1,4 +1,4 @@
-name: Deploy Terraform (Main)
+name: Deploy Terraform
 
 on:
   push:
@@ -7,46 +7,37 @@ on:
       - "terraform/**"
       - "orchestrator/**"
       - ".github/workflows/deploy-terraform.yml"
+      - ".github/workflows/publish-image.yml"
+  workflow_dispatch:
+
+concurrency:
+  group: terraform-deploy
+  cancel-in-progress: false
 
 jobs:
   publish-orchestrator:
-    runs-on: ubuntu-latest
     permissions:
       contents: read
       packages: write
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Log in to GHCR
-        uses: docker/login-action@v3
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Build and push
-        uses: docker/build-push-action@v6
-        with:
-          context: ./orchestrator
-          push: true
-          tags: |
-            ghcr.io/camdenclark/gcrunner:latest
-            ghcr.io/camdenclark/gcrunner:${{ github.sha }}
+    uses: ./.github/workflows/publish-image.yml
+    with:
+      tags: latest ${{ github.sha }}
 
   deploy:
     needs: publish-orchestrator
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     defaults:
       run:
         working-directory: terraform
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: google-github-actions/auth@v2
+      - uses: google-github-actions/auth@v3
         with:
           credentials_json: ${{ secrets.GCP_SA_KEY_DEPLOY }}
 
-      - uses: hashicorp/setup-terraform@v3
+      - uses: hashicorp/setup-terraform@v4
 
       - name: Terraform Init
         run: |
@@ -59,6 +50,7 @@ jobs:
           terraform plan \
             -var="project_id=${{ vars.TF_PROJECT_ID }}" \
             -var="gcrunner_version=${{ github.sha }}" \
+            -var="gcrunner_image_repo=${GITHUB_REPOSITORY,,}" \
             -out=tfplan
 
       - name: Terraform Apply
@@ -67,22 +59,25 @@ jobs:
   smoke-test-n2d-go:
     needs: deploy
     runs-on: gcrunner=${{ github.run_id }}-n2d/machine=n2d-standard-2
+    timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
         with:
-          go-version: "1.22"
+          go-version-file: orchestrator/go.mod
+          cache-dependency-path: orchestrator/go.sum
       - name: Build orchestrator
         run: cd orchestrator && go build ./...
       - name: Test orchestrator
-        run: cd orchestrator && go test ./...
+        run: cd orchestrator && go test -timeout 60s ./...
 
   smoke-test-e2-node:
     needs: deploy
     runs-on: gcrunner=${{ github.run_id }}-e2/machine=e2-medium
+    timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
         with:
           node-version: "22"
       - name: Node smoke test
@@ -96,12 +91,14 @@ jobs:
   smoke-test-c3-go:
     needs: deploy
     runs-on: gcrunner=${{ github.run_id }}-c3/family=c3/cpu=4
+    timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
         with:
-          go-version: "1.22"
+          go-version-file: cache-server/go.mod
+          cache-dependency-path: cache-server/go.sum
       - name: Build cache-server
         run: cd cache-server && go build ./...
       - name: Test cache-server
-        run: cd cache-server && go test ./...
+        run: cd cache-server && go test -timeout 60s ./...

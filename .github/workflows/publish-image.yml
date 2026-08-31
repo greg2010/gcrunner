@@ -1,0 +1,45 @@
+name: Publish Orchestrator Image
+
+on:
+  workflow_call:
+    inputs:
+      tags:
+        description: Space-separated tag names to apply to the image
+        required: true
+        type: string
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Compute image tags
+        id: img
+        env:
+          INPUT_TAGS: ${{ inputs.tags }}
+        run: |
+          name="ghcr.io/${GITHUB_REPOSITORY,,}"
+          tags=""
+          for t in $INPUT_TAGS; do
+            tags="${tags:+${tags},}${name}:${t}"
+          done
+          echo "tags=${tags}" >> "$GITHUB_OUTPUT"
+
+      - name: Build and push
+        uses: docker/build-push-action@v7
+        with:
+          context: ./orchestrator
+          push: true
+          tags: ${{ steps.img.outputs.tags }}
