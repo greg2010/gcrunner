@@ -1,0 +1,68 @@
+name: CI
+
+on:
+  push:
+    branches: [deploy]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test-go:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        module: [orchestrator, cache-server]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: ${{ matrix.module }}/go.mod
+          cache-dependency-path: ${{ matrix.module }}/go.sum
+      - name: Build
+        working-directory: ${{ matrix.module }}
+        run: go build ./...
+      - name: Test
+        working-directory: ${{ matrix.module }}
+        run: go test -timeout 60s ./...
+
+  validate-terraform:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - uses: hashicorp/setup-terraform@v4
+      - name: Init (no backend)
+        working-directory: terraform
+        run: terraform init -backend=false
+      - name: Validate
+        working-directory: terraform
+        run: terraform validate
+
+  validate-packer:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: cache-server/go.mod
+          cache-dependency-path: cache-server/go.sum
+      - name: Build cache-server
+        working-directory: cache-server
+        run: GOOS=linux GOARCH=amd64 go build -o cache-server .
+      - uses: hashicorp/setup-packer@v3
+        with:
+          version: '1.16.0'
+      - name: Init
+        working-directory: images
+        run: packer init .
+      - name: Validate
+        working-directory: images
+        run: |
+          packer validate -var-file=ubuntu2404-x64.pkrvars.hcl -var project_id=ci-validate .
+          packer validate -var-file=ubuntu2204-x64.pkrvars.hcl -var project_id=ci-validate .
