@@ -38,12 +38,13 @@ gcrunner is an open-source, drop-in replacement for GitHub-hosted Actions runner
 1. A GitHub Actions workflow triggers a `workflow_job` webhook event (action: `queued`).
 2. The webhook hits a Cloud Function (HTTP-triggered, Go).
 3. The Cloud Function authenticates the webhook (HMAC-SHA256), parses the `runs-on` labels, and translates them into a Compute Engine VM spec.
-4. The Cloud Function calls the Compute Engine API to create an ephemeral VM with a startup script that:
+4. The Cloud Function registers an ephemeral (single-use) just-in-time (JIT) runner for the target repository, then calls the Compute Engine API to create an ephemeral VM with a startup script that:
    - Downloads and configures the GitHub Actions runner agent
-   - Registers as an ephemeral (single-use) runner for the target repository
+   - Connects to GitHub as the registered runner with the JIT config
    - Signals readiness back to GitHub
-5. GitHub dispatches the job to the new runner.
-6. On job completion, the VM executes a shutdown script that deregisters the runner and deletes itself.
+5. When the VM insert fails, the Cloud Function deletes the runner registration unless a VM with the runner's name exists. A retry that finds the runner name already registered keeps the registration when the VM exists, and otherwise replaces an offline registration.
+6. GitHub dispatches the job to the new runner.
+7. On job completion, the VM executes a shutdown script that deregisters the runner and deletes itself.
 
 ### Completed / In-Progress Hooks
 

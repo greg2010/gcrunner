@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"net/http"
 	"os"
 	"strconv"
 	"strings"
@@ -12,6 +13,7 @@ import (
 	compute "cloud.google.com/go/compute/apiv1"
 	computepb "cloud.google.com/go/compute/apiv1/computepb"
 	"google.golang.org/api/googleapi"
+	"google.golang.org/api/iterator"
 	"google.golang.org/protobuf/proto"
 )
 
@@ -56,6 +58,8 @@ sudo -u runner -E ./run.sh --jitconfig "${JIT_CONFIG}"
 
 var createInstanceForRunner = createInstance
 
+var instanceExistsForRunner = instanceExists
+
 func createRunnerVM(ctx context.Context, event WorkflowJobEvent, labels *RunnerLabels, credentials installationCredentials) error {
 	if err := validateRunnerVMPreflight(labels); err != nil {
 		return err
@@ -66,11 +70,6 @@ func createRunnerVM(ctx context.Context, event WorkflowJobEvent, labels *RunnerL
 	repoFullName := event.Repository.FullName
 
 	instanceName := fmt.Sprintf("gcrunner-%d-%d", event.WorkflowJob.RunID, event.WorkflowJob.ID)
-
-	jitConfig, err := githubAPIClient.generateJITConfig(ctx, owner, repo, instanceName, event.WorkflowJob.Labels, credentials)
-	if err != nil {
-		return fmt.Errorf("generate JIT config: %w", err)
-	}
 
 	cacheBucket := os.Getenv("GCRUNNER_CACHE_BUCKET")
 	startupScript := fmt.Sprintf(startupScriptTemplate, cacheBucket, owner, repo)
@@ -87,7 +86,27 @@ func createRunnerVM(ctx context.Context, event WorkflowJobEvent, labels *RunnerL
 		log.Printf("WARN zone_discovery_failed region=%s error=%v", region, zoneErr)
 	}
 
-	return createVMInZones(zones, func(zone string) error {
+	runner, err := githubAPIClient.generateJITConfig(ctx, owner, repo, instanceName, event.WorkflowJob.Labels, credentials)
+	if err != nil {
+		var ghErr *githubStatusError
+		if !errors.As(err, &ghErr) || ghErr.Status != http.StatusConflict {
+			return fmt.Errorf("generate JIT config: %w", err)
+		}
+		exists, existsErr := instanceExistsForRunner(ctx, project, instanceName)
+		if existsErr != nil {
+			return fmt.Errorf("check for existing VM %s: %w", instanceName, existsErr)
+		}
+		if exists {
+			log.Printf("VM %s already exists; keeping its runner registration", instanceName)
+			return nil
+		}
+		runner, err = replaceStaleRunner(ctx, owner, repo, instanceName, event.WorkflowJob.Labels, credentials)
+		if err != nil {
+			return fmt.Errorf("replace stale runner: %w", err)
+		}
+	}
+
+	err = createVMInZones(zones, func(zone string) error {
 		machineType := labels.Machine
 		if labels.MachineMode != "exact" {
 			resolved, err := ResolveMachineType(ctx, project, zone, labels)
@@ -97,12 +116,45 @@ func createRunnerVM(ctx context.Context, event WorkflowJobEvent, labels *RunnerL
 			machineType = resolved
 		}
 
-		err := createInstanceForRunner(ctx, instanceName, zone, machineType, labels, startupScript, jitConfig)
+		err := createInstanceForRunner(ctx, instanceName, zone, machineType, labels, startupScript, runner.EncodedConfig)
 		if err == nil {
 			log.Printf("Created VM %s in %s (type=%s) for %s", instanceName, zone, machineType, repoFullName)
 		}
 		return err
 	})
+	if err != nil {
+		exists, existsErr := instanceExistsForRunner(ctx, project, instanceName)
+		switch {
+		case existsErr != nil:
+			log.Printf("WARN runner_registration_kept repo=%s runner=%s runner_id=%d error=%v", repoFullName, instanceName, runner.ID, existsErr)
+		case exists:
+			log.Printf("WARN runner_registration_kept repo=%s runner=%s runner_id=%d reason=vm_exists", repoFullName, instanceName, runner.ID)
+		default:
+			if delErr := githubAPIClient.deleteRunner(ctx, owner, repo, runner.ID, credentials); delErr != nil {
+				log.Printf("WARN runner_registration_delete_failed repo=%s runner=%s runner_id=%d error=%v", repoFullName, instanceName, runner.ID, delErr)
+			}
+		}
+		return err
+	}
+	return nil
+}
+
+// replaceStaleRunner deletes an offline registration that blocks name and registers name again.
+func replaceStaleRunner(ctx context.Context, owner, repo, name string, labels []string, credentials installationCredentials) (jitRunner, error) {
+	stale, err := githubAPIClient.findRunnerByName(ctx, owner, repo, name, credentials)
+	if err != nil {
+		return jitRunner{}, fmt.Errorf("look up runner %s: %w", name, err)
+	}
+	if stale != nil {
+		if stale.Busy || stale.Status != "offline" {
+			return jitRunner{}, fmt.Errorf("runner %s is %s (busy=%t); not replacing it", name, stale.Status, stale.Busy)
+		}
+		if err := githubAPIClient.deleteRunner(ctx, owner, repo, stale.ID, credentials); err != nil {
+			return jitRunner{}, fmt.Errorf("delete stale runner %s (id %d): %w", name, stale.ID, err)
+		}
+		log.Printf("Deleted stale runner registration %s (id %d)", name, stale.ID)
+	}
+	return githubAPIClient.generateJITConfig(ctx, owner, repo, name, labels, credentials)
 }
 
 func createVMInZones(zones []string, create func(string) error) error {
@@ -261,6 +313,34 @@ func createInstance(ctx context.Context, name, zone, machineType string, labels 
 	}
 
 	return op.Wait(ctx)
+}
+
+// instanceExists reports whether an instance called name exists in any zone of project.
+func instanceExists(ctx context.Context, project, name string) (bool, error) {
+	client, err := compute.NewInstancesRESTClient(ctx)
+	if err != nil {
+		return false, fmt.Errorf("create compute client: %w", err)
+	}
+	defer func() {
+		if err := client.Close(); err != nil {
+			log.Printf("WARN compute_client_close_failed operation=list_instances error=%v", err)
+		}
+	}()
+
+	filter := fmt.Sprintf("name = %q", name)
+	it := client.AggregatedList(ctx, &computepb.AggregatedListInstancesRequest{Project: project, Filter: &filter})
+	for {
+		pair, err := it.Next()
+		if errors.Is(err, iterator.Done) {
+			return false, nil
+		}
+		if err != nil {
+			return false, fmt.Errorf("list instances named %s: %w", name, err)
+		}
+		if len(pair.Value.GetInstances()) > 0 {
+			return true, nil
+		}
+	}
 }
 
 func runnerVMZones(ctx context.Context, project, region string, labels *RunnerLabels, listZones func(context.Context, string, string) ([]string, error)) ([]string, error) {

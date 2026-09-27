@@ -11,6 +11,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	neturl "net/url"
 	"strconv"
 	"strings"
 	"time"
@@ -36,12 +37,10 @@ type installationCredentials struct {
 
 func (c githubAPI) getWorkflowJobStatus(ctx context.Context, owner, repo string, jobID int64, credentials installationCredentials) (string, error) {
 	url := fmt.Sprintf("%s/repos/%s/%s/actions/jobs/%d", c.baseURL, owner, repo, jobID)
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	req, err := c.newRequest(ctx, http.MethodGet, url, nil, credentials)
 	if err != nil {
 		return "", fmt.Errorf("create workflow job request: %w", err)
 	}
-	req.Header.Set("Authorization", "Bearer "+credentials.token)
-	req.Header.Set("Accept", "application/vnd.github+json")
 
 	resp, err := c.client.Do(req)
 	if err != nil {
@@ -53,8 +52,11 @@ func (c githubAPI) getWorkflowJobStatus(ctx context.Context, owner, repo string,
 		}
 	}()
 
+	if resp.StatusCode == http.StatusNotFound {
+		return "", workflowJobNotFoundError(resp.Body, jobID, owner+"/"+repo)
+	}
 	if resp.StatusCode != http.StatusOK {
-		return "", workflowJobStatusError(resp.StatusCode, resp.Body, jobID, owner+"/"+repo)
+		return "", c.statusError(resp)
 	}
 
 	var result struct {
@@ -69,23 +71,58 @@ func (c githubAPI) getWorkflowJobStatus(ctx context.Context, owner, repo string,
 	return result.Status, nil
 }
 
-func workflowJobStatusError(statusCode int, body io.Reader, jobID int64, repo string) error {
-	notFound := statusCode == http.StatusNotFound
+func workflowJobNotFoundError(body io.Reader, jobID int64, repo string) error {
 	responseBody, err := io.ReadAll(body)
 	if err != nil {
-		if notFound {
-			log.Printf("WARN workflow_job_error_response_read_failed job_id=%d repo=%s error=%v", jobID, repo, err)
-			return fmt.Errorf("%w: GitHub returned %d", errWorkflowJobNotFound, statusCode)
-		}
-		return fmt.Errorf("read workflow job error response: %w", err)
+		log.Printf("WARN workflow_job_error_response_read_failed job_id=%d repo=%s error=%v", jobID, repo, err)
+		return fmt.Errorf("%w: GitHub returned %d", errWorkflowJobNotFound, http.StatusNotFound)
 	}
-	if notFound {
-		return fmt.Errorf("%w: GitHub returned %d: %s", errWorkflowJobNotFound, statusCode, string(responseBody))
-	}
-	return fmt.Errorf("GitHub returned %d: %s", statusCode, string(responseBody))
+	return fmt.Errorf("%w: GitHub returned %d: %s", errWorkflowJobNotFound, http.StatusNotFound, string(responseBody))
 }
 
-func (c githubAPI) generateJITConfig(ctx context.Context, owner, repo, runnerName string, labels []string, credentials installationCredentials) (string, error) {
+// githubStatusError is a GitHub REST response with a status the caller did not accept.
+type githubStatusError struct {
+	Status int
+	Body   string
+}
+
+func (e *githubStatusError) Error() string {
+	return fmt.Sprintf("GitHub returned %d: %s", e.Status, e.Body)
+}
+
+// jitRunner is the runner a generate-jitconfig call registered.
+type jitRunner struct {
+	ID            int64
+	EncodedConfig string
+}
+
+// registeredRunner is one entry of the repository's self-hosted runner list.
+type registeredRunner struct {
+	ID     int64  `json:"id"`
+	Name   string `json:"name"`
+	Status string `json:"status"`
+	Busy   bool   `json:"busy"`
+}
+
+func (c githubAPI) statusError(resp *http.Response) error {
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return fmt.Errorf("read GitHub %d response: %w", resp.StatusCode, err)
+	}
+	return &githubStatusError{Status: resp.StatusCode, Body: string(body)}
+}
+
+func (c githubAPI) newRequest(ctx context.Context, method, url string, body io.Reader, credentials installationCredentials) (*http.Request, error) {
+	req, err := http.NewRequestWithContext(ctx, method, url, body)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Authorization", "Bearer "+credentials.token)
+	req.Header.Set("Accept", "application/vnd.github+json")
+	return req, nil
+}
+
+func (c githubAPI) generateJITConfig(ctx context.Context, owner, repo, runnerName string, labels []string, credentials installationCredentials) (jitRunner, error) {
 	body := struct {
 		Name          string   `json:"name"`
 		RunnerGroupID int      `json:"runner_group_id"`
@@ -99,21 +136,19 @@ func (c githubAPI) generateJITConfig(ctx context.Context, owner, repo, runnerNam
 	}
 	bodyJSON, err := json.Marshal(body)
 	if err != nil {
-		return "", fmt.Errorf("marshal request body: %w", err)
+		return jitRunner{}, fmt.Errorf("marshal request body: %w", err)
 	}
 
 	url := fmt.Sprintf("%s/repos/%s/%s/actions/runners/generate-jitconfig", c.baseURL, owner, repo)
-	req, err := http.NewRequestWithContext(ctx, "POST", url, strings.NewReader(string(bodyJSON)))
+	req, err := c.newRequest(ctx, http.MethodPost, url, strings.NewReader(string(bodyJSON)), credentials)
 	if err != nil {
-		return "", err
+		return jitRunner{}, err
 	}
-	req.Header.Set("Authorization", "Bearer "+credentials.token)
-	req.Header.Set("Accept", "application/vnd.github+json")
 	req.Header.Set("Content-Type", "application/json")
 
 	resp, err := c.client.Do(req)
 	if err != nil {
-		return "", err
+		return jitRunner{}, err
 	}
 	defer func() {
 		if err := resp.Body.Close(); err != nil {
@@ -122,23 +157,85 @@ func (c githubAPI) generateJITConfig(ctx context.Context, owner, repo, runnerNam
 	}()
 
 	if resp.StatusCode != http.StatusCreated {
-		respBody, readErr := io.ReadAll(resp.Body)
-		if readErr != nil {
-			return "", fmt.Errorf("read generate JIT config error response: %w", readErr)
-		}
-		return "", fmt.Errorf("GitHub returned %d: %s", resp.StatusCode, string(respBody))
+		return jitRunner{}, c.statusError(resp)
 	}
 
 	var result struct {
+		Runner struct {
+			ID int64 `json:"id"`
+		} `json:"runner"`
 		EncodedJITConfig string `json:"encoded_jit_config"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		return "", err
+		return jitRunner{}, err
 	}
 	if result.EncodedJITConfig == "" {
-		return "", fmt.Errorf("generate JIT config response missing encoded_jit_config")
+		return jitRunner{}, fmt.Errorf("generate JIT config response missing encoded_jit_config")
 	}
-	return result.EncodedJITConfig, nil
+	if result.Runner.ID == 0 {
+		return jitRunner{}, fmt.Errorf("generate-jitconfig response has no runner id")
+	}
+	return jitRunner{ID: result.Runner.ID, EncodedConfig: result.EncodedJITConfig}, nil
+}
+
+// findRunnerByName returns the repository runner registered under name, or nil when there is none.
+func (c githubAPI) findRunnerByName(ctx context.Context, owner, repo, name string, credentials installationCredentials) (*registeredRunner, error) {
+	url := fmt.Sprintf("%s/repos/%s/%s/actions/runners?name=%s", c.baseURL, owner, repo, neturl.QueryEscape(name))
+	req, err := c.newRequest(ctx, http.MethodGet, url, nil, credentials)
+	if err != nil {
+		return nil, err
+	}
+
+	resp, err := c.client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer func() {
+		if err := resp.Body.Close(); err != nil {
+			log.Printf("WARN github_response_close_failed operation=find_runner_by_name repo=%s error=%v", owner+"/"+repo, err)
+		}
+	}()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, c.statusError(resp)
+	}
+
+	var result struct {
+		Runners []registeredRunner `json:"runners"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return nil, fmt.Errorf("decode list runners response: %w", err)
+	}
+	for _, runner := range result.Runners {
+		if runner.Name == name {
+			return &runner, nil
+		}
+	}
+	return nil, nil
+}
+
+// deleteRunner removes a runner registration; a runner that is already gone is not an error.
+func (c githubAPI) deleteRunner(ctx context.Context, owner, repo string, runnerID int64, credentials installationCredentials) error {
+	url := fmt.Sprintf("%s/repos/%s/%s/actions/runners/%d", c.baseURL, owner, repo, runnerID)
+	req, err := c.newRequest(ctx, http.MethodDelete, url, nil, credentials)
+	if err != nil {
+		return err
+	}
+
+	resp, err := c.client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if err := resp.Body.Close(); err != nil {
+			log.Printf("WARN github_response_close_failed operation=delete_runner repo=%s error=%v", owner+"/"+repo, err)
+		}
+	}()
+
+	if resp.StatusCode == http.StatusNoContent || resp.StatusCode == http.StatusNotFound {
+		return nil
+	}
+	return c.statusError(resp)
 }
 
 func (c githubAPI) getInstallationCredentials(ctx context.Context, owner string) (installationCredentials, error) {
@@ -179,11 +276,7 @@ func (c githubAPI) getInstallationToken(ctx context.Context, owner string) (stri
 	}()
 
 	if resp.StatusCode != http.StatusCreated {
-		body, readErr := io.ReadAll(resp.Body)
-		if readErr != nil {
-			return "", fmt.Errorf("read installation token error response: %w", readErr)
-		}
-		return "", fmt.Errorf("GitHub returned %d: %s", resp.StatusCode, string(body))
+		return "", c.statusError(resp)
 	}
 
 	var result struct {
@@ -215,11 +308,7 @@ func (c githubAPI) getInstallationID(ctx context.Context, appJWT, owner string) 
 	}()
 
 	if resp.StatusCode != http.StatusOK {
-		body, readErr := io.ReadAll(resp.Body)
-		if readErr != nil {
-			return 0, fmt.Errorf("read installation ID error response: %w", readErr)
-		}
-		return 0, fmt.Errorf("GitHub returned %d: %s", resp.StatusCode, string(body))
+		return 0, c.statusError(resp)
 	}
 
 	var result struct {

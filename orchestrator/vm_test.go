@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"slices"
+	"strings"
 	"testing"
 
 	"google.golang.org/api/googleapi"
@@ -131,7 +133,8 @@ func TestCreateRunnerVMGeneratesJITAfterPreflight(t *testing.T) {
 		seedTypes       []*MachineTypeInfo
 		wantErr         bool
 		wantJITCalls    int
-		wantVMCalls     int
+		wantZones       []string
+		wantJIT         string
 	}{
 		{
 			name:    "invalid labels do not generate JIT config",
@@ -162,7 +165,8 @@ func TestCreateRunnerVMGeneratesJITAfterPreflight(t *testing.T) {
 			name:         "VM creation generates one JIT config",
 			labels:       &RunnerLabels{MachineMode: "exact", Machine: "n2d-standard-4", Disk: "75gb", Zone: "us-central1-a"},
 			wantJITCalls: 1,
-			wantVMCalls:  1,
+			wantZones:    []string{"us-central1-a"},
+			wantJIT:      "jit-config",
 		},
 		{
 			name:     "valid multi-family creates VM",
@@ -172,7 +176,8 @@ func TestCreateRunnerVMGeneratesJITAfterPreflight(t *testing.T) {
 				{Name: "n2d-standard-4", Family: "n2d", Category: "standard", VCPUs: 4, MemoryMB: 16384},
 			},
 			wantJITCalls: 1,
-			wantVMCalls:  1,
+			wantZones:    []string{"jit-test-zone"},
+			wantJIT:      "jit-config",
 		},
 		{
 			name:            "empty JIT config response fails before VM creation",
@@ -224,7 +229,7 @@ func TestCreateRunnerVMGeneratesJITAfterPreflight(t *testing.T) {
 				w.WriteHeader(http.StatusCreated)
 				responseBody := tt.jitResponseBody
 				if responseBody == "" {
-					responseBody = `{"encoded_jit_config":"jit-config"}`
+					responseBody = `{"runner":{"id":7},"encoded_jit_config":"jit-config"}`
 				}
 				if _, err := w.Write([]byte(responseBody)); err != nil {
 					t.Errorf("write JIT response: %v", err)
@@ -238,10 +243,22 @@ func TestCreateRunnerVMGeneratesJITAfterPreflight(t *testing.T) {
 				githubAPIClient = originalGitHubAPIClient
 			})
 
-			vmCalls := 0
+			existsNames := []string{}
+			originalInstanceExists := instanceExistsForRunner
+			instanceExistsForRunner = func(_ context.Context, _, name string) (bool, error) {
+				existsNames = append(existsNames, name)
+				return false, nil
+			}
+			t.Cleanup(func() {
+				instanceExistsForRunner = originalInstanceExists
+			})
+
+			zones := []string{}
+			var vmJITConfig string
 			originalCreateInstance := createInstanceForRunner
-			createInstanceForRunner = func(_ context.Context, _, _, _ string, _ *RunnerLabels, _, _ string) error {
-				vmCalls++
+			createInstanceForRunner = func(_ context.Context, _, zone, _ string, _ *RunnerLabels, _, jitConfig string) error {
+				zones = append(zones, zone)
+				vmJITConfig = jitConfig
 				return nil
 			}
 			t.Cleanup(func() {
@@ -259,8 +276,264 @@ func TestCreateRunnerVMGeneratesJITAfterPreflight(t *testing.T) {
 			if jitCalls != tt.wantJITCalls {
 				t.Errorf("JIT config calls = %d, want %d", jitCalls, tt.wantJITCalls)
 			}
-			if vmCalls != tt.wantVMCalls {
-				t.Errorf("VM creation calls = %d, want %d", vmCalls, tt.wantVMCalls)
+			if !slices.Equal(existsNames, []string{}) {
+				t.Errorf("existence checks = %q, want none", existsNames)
+			}
+			if !slices.Equal(zones, tt.wantZones) {
+				t.Errorf("insert zones = %q, want %q", zones, tt.wantZones)
+			}
+			if vmJITConfig != tt.wantJIT {
+				t.Errorf("VM JIT config = %q, want %q", vmJITConfig, tt.wantJIT)
+			}
+		})
+	}
+}
+
+func TestCreateRunnerVMStaleRegistration(t *testing.T) {
+	type response struct {
+		status int
+		body   string
+	}
+	const (
+		runnerName    = "gcrunner-100-200"
+		jitRequest    = "POST /repos/octo-org/octo-repo/actions/runners/generate-jitconfig"
+		listRequest   = "GET /repos/octo-org/octo-repo/actions/runners?name=gcrunner-100-200"
+		deleteRequest = "DELETE /repos/octo-org/octo-repo/actions/runners/7"
+		conflictBody  = `{"message":"Already exists - A runner with the name gcrunner-100-200 already exists."}`
+		createdOld    = `{"runner":{"id":7},"encoded_jit_config":"old"}`
+		createdNew    = `{"runner":{"id":43},"encoded_jit_config":"new"}`
+		offlineRunner = `{"runners":[{"id":42,"name":"gcrunner-100-200","status":"offline","busy":false}]}`
+	)
+	jitConflict := response{http.StatusConflict, conflictBody}
+	jitCreated := response{http.StatusCreated, createdOld}
+	noRunners := response{http.StatusOK, `{"runners":[]}`}
+	deleted := response{http.StatusNoContent, ""}
+	existsErr := errors.New("compute unavailable")
+	retryableErr := errors.New("backend error")
+	quotaErr := &googleapi.Error{Code: 403, Errors: []googleapi.ErrorItem{{Reason: "quotaExceeded"}}}
+	fatalErr := &googleapi.Error{Code: 400, Errors: []googleapi.ErrorItem{{Reason: "invalid"}}}
+	oneZone := []string{"us-central1-a"}
+	checked := []string{runnerName}
+
+	tests := []struct {
+		name         string
+		script       []response
+		vmExists     bool
+		existsErr    error
+		insertErr    error
+		wantErrText  string
+		wantFatal    bool
+		wantRequests []string
+		wantExists   []string
+		wantZones    []string
+		wantJIT      string
+	}{
+		{
+			name:         "409 with an existing VM keeps the registration",
+			script:       []response{jitConflict},
+			vmExists:     true,
+			wantRequests: []string{jitRequest},
+			wantExists:   checked,
+		},
+		{
+			name:         "409 with no VM replaces the offline runner",
+			script:       []response{jitConflict, {http.StatusOK, offlineRunner}, deleted, {http.StatusCreated, createdNew}},
+			wantRequests: []string{jitRequest, listRequest, "DELETE /repos/octo-org/octo-repo/actions/runners/42", jitRequest},
+			wantExists:   checked,
+			wantZones:    oneZone,
+			wantJIT:      "new",
+		},
+		{
+			name: "409 with an online runner is left for the next retry",
+			script: []response{
+				jitConflict,
+				{http.StatusOK, `{"runners":[{"id":42,"name":"gcrunner-100-200","status":"online","busy":false}]}`},
+			},
+			wantErrText:  "not replacing it",
+			wantRequests: []string{jitRequest, listRequest},
+			wantExists:   checked,
+		},
+		{
+			name: "409 with a busy runner is left for the next retry",
+			script: []response{
+				jitConflict,
+				{http.StatusOK, `{"runners":[{"id":42,"name":"gcrunner-100-200","status":"offline","busy":true}]}`},
+			},
+			wantErrText:  "not replacing it",
+			wantRequests: []string{jitRequest, listRequest},
+			wantExists:   checked,
+		},
+		{
+			name:         "409 and the runner is already gone registers once more",
+			script:       []response{jitConflict, noRunners, {http.StatusCreated, createdNew}},
+			wantRequests: []string{jitRequest, listRequest, jitRequest},
+			wantExists:   checked,
+			wantZones:    oneZone,
+			wantJIT:      "new",
+		},
+		{
+			name:         "409 twice is returned",
+			script:       []response{jitConflict, noRunners, jitConflict},
+			wantErrText:  "GitHub returned 409",
+			wantRequests: []string{jitRequest, listRequest, jitRequest},
+			wantExists:   checked,
+		},
+		{
+			name:         "a lookup failure on 409 is returned",
+			script:       []response{jitConflict, {http.StatusInternalServerError, `{"message":"boom"}`}},
+			wantErrText:  "look up runner",
+			wantRequests: []string{jitRequest, listRequest},
+			wantExists:   checked,
+		},
+		{
+			name:         "an existence check failure is returned",
+			script:       []response{jitConflict},
+			existsErr:    existsErr,
+			wantErrText:  "check for existing VM",
+			wantRequests: []string{jitRequest},
+			wantExists:   checked,
+		},
+		{
+			name:         "a retryable insert failure deletes the registration",
+			script:       []response{jitCreated, deleted},
+			insertErr:    retryableErr,
+			wantRequests: []string{jitRequest, deleteRequest},
+			wantExists:   checked,
+			wantZones:    oneZone,
+			wantJIT:      "old",
+		},
+		{
+			name:         "a quota insert failure deletes the registration",
+			script:       []response{jitCreated, deleted},
+			insertErr:    quotaErr,
+			wantRequests: []string{jitRequest, deleteRequest},
+			wantExists:   checked,
+			wantZones:    oneZone,
+			wantJIT:      "old",
+		},
+		{
+			name:         "a fatal insert failure deletes the registration and stays fatal",
+			script:       []response{jitCreated, deleted},
+			insertErr:    fatalErr,
+			wantFatal:    true,
+			wantRequests: []string{jitRequest, deleteRequest},
+			wantExists:   checked,
+			wantZones:    oneZone,
+			wantJIT:      "old",
+		},
+		{
+			name:         "an insert failure keeps the registration when the VM exists",
+			script:       []response{jitCreated},
+			vmExists:     true,
+			insertErr:    retryableErr,
+			wantRequests: []string{jitRequest},
+			wantExists:   checked,
+			wantZones:    oneZone,
+			wantJIT:      "old",
+		},
+		{
+			name:         "an insert failure keeps the registration when the existence check fails",
+			script:       []response{jitCreated},
+			existsErr:    existsErr,
+			insertErr:    retryableErr,
+			wantRequests: []string{jitRequest},
+			wantExists:   checked,
+			wantZones:    oneZone,
+			wantJIT:      "old",
+		},
+		{
+			name:         "an insert failure still returns when the delete fails",
+			script:       []response{jitCreated, {http.StatusInternalServerError, `{"message":"boom"}`}},
+			insertErr:    retryableErr,
+			wantRequests: []string{jitRequest, deleteRequest},
+			wantExists:   checked,
+			wantZones:    oneZone,
+			wantJIT:      "old",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			requests := []string{}
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				request := r.Method + " " + r.URL.Path
+				if r.URL.RawQuery != "" {
+					request += "?" + r.URL.RawQuery
+				}
+				requests = append(requests, request)
+				if len(requests) > len(tt.script) {
+					t.Errorf("unscripted request %d: %s", len(requests), request)
+					w.WriteHeader(http.StatusTeapot)
+					return
+				}
+				resp := tt.script[len(requests)-1]
+				w.WriteHeader(resp.status)
+				if _, err := w.Write([]byte(resp.body)); err != nil {
+					t.Errorf("write response: %v", err)
+				}
+			}))
+			defer server.Close()
+
+			originalGitHubAPIClient := githubAPIClient
+			githubAPIClient = githubAPI{baseURL: server.URL, client: server.Client()}
+			t.Cleanup(func() {
+				githubAPIClient = originalGitHubAPIClient
+			})
+
+			existsNames := []string{}
+			originalInstanceExists := instanceExistsForRunner
+			instanceExistsForRunner = func(_ context.Context, _, name string) (bool, error) {
+				existsNames = append(existsNames, name)
+				return tt.vmExists, tt.existsErr
+			}
+			t.Cleanup(func() {
+				instanceExistsForRunner = originalInstanceExists
+			})
+
+			zones := []string{}
+			var insertedJIT string
+			originalCreateInstance := createInstanceForRunner
+			createInstanceForRunner = func(_ context.Context, _, zone, _ string, _ *RunnerLabels, _, jitConfig string) error {
+				zones = append(zones, zone)
+				insertedJIT = jitConfig
+				return tt.insertErr
+			}
+			t.Cleanup(func() {
+				createInstanceForRunner = originalCreateInstance
+			})
+
+			err := createRunnerVM(context.Background(), WorkflowJobEvent{
+				WorkflowJob: WorkflowJob{ID: 200, RunID: 100, Labels: []string{"gcrunner=test"}},
+				Repository:  Repository{Owner: RepositoryOwner{Login: "octo-org"}, Name: "octo-repo"},
+			}, &RunnerLabels{MachineMode: "exact", Machine: "n2d-standard-4", Disk: "75gb", Zone: "us-central1-a"},
+				installationCredentials{token: "token"})
+
+			switch {
+			case tt.insertErr != nil:
+				if !errors.Is(err, tt.insertErr) {
+					t.Fatalf("createRunnerVM() error = %v, want wrapped %v", err, tt.insertErr)
+				}
+				if isFatalVMCreationError(err) != tt.wantFatal {
+					t.Errorf("createRunnerVM() fatal = %t, want %t (error = %v)", isFatalVMCreationError(err), tt.wantFatal, err)
+				}
+			case tt.wantErrText != "":
+				if err == nil || !strings.Contains(err.Error(), tt.wantErrText) {
+					t.Fatalf("createRunnerVM() error = %v, want containing %q", err, tt.wantErrText)
+				}
+			case err != nil:
+				t.Fatalf("createRunnerVM() error = %v", err)
+			}
+			if !slices.Equal(requests, tt.wantRequests) {
+				t.Errorf("requests = %q, want %q", requests, tt.wantRequests)
+			}
+			if !slices.Equal(existsNames, tt.wantExists) {
+				t.Errorf("existence checks = %q, want %q", existsNames, tt.wantExists)
+			}
+			if !slices.Equal(zones, tt.wantZones) {
+				t.Errorf("insert zones = %q, want %q", zones, tt.wantZones)
+			}
+			if insertedJIT != tt.wantJIT {
+				t.Errorf("inserted JIT config = %q, want %q", insertedJIT, tt.wantJIT)
 			}
 		})
 	}
