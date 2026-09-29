@@ -7,6 +7,7 @@ require (
 	cloud.google.com/go/compute v1.67.0
 	cloud.google.com/go/secretmanager v1.21.0
 	github.com/golang-jwt/jwt/v5 v5.3.1
+	github.com/googleapis/gax-go/v2 v2.24.0
 	github.com/stretchr/testify v1.12.1
 	google.golang.org/api v0.295.0
 	google.golang.org/protobuf v1.36.12
@@ -23,7 +24,6 @@ require (
 	github.com/go-logr/stdr v1.2.2 // indirect
 	github.com/google/s2a-go v0.1.9 // indirect
 	github.com/googleapis/enterprise-certificate-proxy v0.3.21 // indirect
-	github.com/googleapis/gax-go/v2 v2.24.0 // indirect
 	github.com/stretchr/objx v0.5.3 // indirect
 	go.opentelemetry.io/auto/sdk v1.2.1 // indirect
 	go.opentelemetry.io/contrib/instrumentation/google.golang.org/grpc/otelgrpc v0.71.0 // indirect

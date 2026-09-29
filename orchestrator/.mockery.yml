@@ -28,6 +28,7 @@ packages:
     interfaces:
       cloudTasksClientFactory: {}
       installationCredentialsResolver: {}
+      operationPoller: {}
       runnerVMCreator: {}
       runnerVMDeleter: {}
       secretManagerClientFactory: {}

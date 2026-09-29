@@ -10,8 +10,14 @@ import (
 	"slices"
 	"strings"
 	"testing"
+	"time"
 
+	compute "cloud.google.com/go/compute/apiv1"
+	computepb "cloud.google.com/go/compute/apiv1/computepb"
+	gax "github.com/googleapis/gax-go/v2"
+	"github.com/stretchr/testify/mock"
 	"google.golang.org/api/googleapi"
+	"google.golang.org/protobuf/proto"
 )
 
 func TestParseDiskSize(t *testing.T) {
@@ -41,6 +47,11 @@ func TestParseDiskSize(t *testing.T) {
 	}
 }
 
+var operationQuotaErr = &googleapi.Error{
+	Code:    403,
+	Message: `FORBIDDEN: errors:{code:"QUOTA_EXCEEDED" error_details:{quota_info:{metric_name:"compute.googleapis.com/cpus_all_regions"}}} message:"Quota 'CPUS_ALL_REGIONS' exceeded.  Limit: 32.0 globally."`,
+}
+
 func TestClassifyVMInsertError(t *testing.T) {
 	tests := []struct {
 		name string
@@ -57,6 +68,7 @@ func TestClassifyVMInsertError(t *testing.T) {
 		{name: "Google API unauthorized without details", err: &googleapi.Error{Code: 401, Message: "Unauthorized"}, want: insertErrorFatal},
 		{name: "Google API conflict without details", err: &googleapi.Error{Code: 409}, want: insertErrorAlreadyExists},
 		{name: "Google API conflict with quota reason", err: &googleapi.Error{Code: 409, Errors: []googleapi.ErrorItem{{Reason: "quotaExceeded"}}}, want: insertErrorQuota},
+		{name: "wrapped operation quota exceeded without details", err: fmt.Errorf("insert: %w", operationQuotaErr), want: insertErrorQuota},
 		{name: "operation quota exceeded", err: errors.New("QUOTA_EXCEEDED: insufficient regional quota"), want: insertErrorQuota},
 		{name: "operation resource not found", err: errors.New("RESOURCE_NOT_FOUND: machine type not available"), want: insertErrorFatal},
 		{name: "already exists", err: errors.New("The resource already exists"), want: insertErrorAlreadyExists},
@@ -542,11 +554,23 @@ func TestCreateRunnerVMStaleRegistration(t *testing.T) {
 func TestCreateVMInZones(t *testing.T) {
 	tests := []struct {
 		name         string
+		zones        []string
 		errorsByZone map[string]error
 		wantCalls    []string
 		wantFatal    bool
+		wantQuota    bool
 		wantErr      bool
 	}{
+		{
+			name:  "operation quota error in first zone stops zone retries",
+			zones: []string{"a", "b", "c"},
+			errorsByZone: map[string]error{
+				"a": operationQuotaErr,
+			},
+			wantCalls: []string{"a"},
+			wantQuota: true,
+			wantErr:   true,
+		},
 		{
 			name: "not found in first zone succeeds in second",
 			errorsByZone: map[string]error{
@@ -613,7 +637,11 @@ func TestCreateVMInZones(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			var calls []string
-			err := createVMInZones([]string{"zone-a", "zone-b"}, func(zone string) error {
+			zones := tt.zones
+			if zones == nil {
+				zones = []string{"zone-a", "zone-b"}
+			}
+			err := createVMInZones(zones, func(zone string) error {
 				calls = append(calls, zone)
 				return tt.errorsByZone[zone]
 			})
@@ -624,12 +652,105 @@ func TestCreateVMInZones(t *testing.T) {
 			if isFatalVMCreationError(err) != tt.wantFatal {
 				t.Errorf("isFatalVMCreationError() = %t, want %t", isFatalVMCreationError(err), tt.wantFatal)
 			}
+			var creationErr *vmCreationError
+			if gotQuota := errors.As(err, &creationErr) && creationErr.kind == insertErrorQuota; gotQuota != tt.wantQuota {
+				t.Errorf("quota vmCreationError = %t, want %t (error = %v)", gotQuota, tt.wantQuota, err)
+			}
 			if fmt.Sprint(calls) != fmt.Sprint(tt.wantCalls) {
 				t.Errorf("zones called = %v, want %v", calls, tt.wantCalls)
 			}
 		})
 	}
 }
+
+func TestWaitForOperationDone(t *testing.T) {
+	type pollStep struct {
+		err  error
+		done bool
+	}
+	pollErr := &googleapi.Error{Code: 403, Message: `FORBIDDEN: errors:{code:"QUOTA_EXCEEDED"}`}
+	transportErr := errors.New("get operation: connection reset")
+
+	tests := []struct {
+		name            string
+		steps           []pollStep
+		proto           *computepb.Operation
+		interval        time.Duration
+		cancelAfterPoll bool
+		wantErr         error
+		wantPolls       int
+	}{
+		{
+			name:      "operation failed, done on second poll",
+			steps:     []pollStep{{err: pollErr}, {err: pollErr, done: true}},
+			proto:     &computepb.Operation{HttpErrorStatusCode: proto.Int32(403)},
+			interval:  time.Millisecond,
+			wantErr:   pollErr,
+			wantPolls: 2,
+		},
+		{
+			name:      "done on first poll",
+			steps:     []pollStep{{done: true}},
+			interval:  time.Millisecond,
+			wantPolls: 1,
+		},
+		{
+			name:      "transport error before done",
+			steps:     []pollStep{{err: transportErr}},
+			proto:     &computepb.Operation{},
+			interval:  time.Millisecond,
+			wantErr:   transportErr,
+			wantPolls: 1,
+		},
+		{
+			// An hour-long interval makes the cancelled context the only way out of the wait.
+			name:            "context cancelled while waiting",
+			steps:           []pollStep{{}},
+			interval:        time.Hour,
+			cancelAfterPoll: true,
+			wantErr:         context.Canceled,
+			wantPolls:       1,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+
+			polls := 0
+			op := NewMockOperationPoller(t)
+			op.EXPECT().Poll(mock.Anything).RunAndReturn(func(context.Context, ...gax.CallOption) error {
+				polls++
+				if polls > len(tt.steps) {
+					t.Errorf("unscripted poll %d", polls)
+					return nil
+				}
+				if tt.cancelAfterPoll {
+					cancel()
+				}
+				return tt.steps[polls-1].err
+			})
+			op.EXPECT().Done().RunAndReturn(func() bool {
+				return tt.steps[min(polls, len(tt.steps))-1].done
+			})
+			if tt.proto != nil {
+				op.EXPECT().Proto().Return(tt.proto)
+			}
+
+			err := waitForOperationDone(ctx, op, tt.interval)
+
+			if !errors.Is(err, tt.wantErr) {
+				t.Errorf("waitForOperationDone() error = %v, want %v", err, tt.wantErr)
+			}
+			if polls != tt.wantPolls {
+				t.Errorf("polls = %d, want %d", polls, tt.wantPolls)
+			}
+		})
+	}
+}
+
+var _ operationPoller = (*compute.Operation)(nil)
 
 func TestRunnerVMZones(t *testing.T) {
 	tests := []struct {

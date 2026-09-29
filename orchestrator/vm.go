@@ -9,9 +9,11 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"time"
 
 	compute "cloud.google.com/go/compute/apiv1"
 	computepb "cloud.google.com/go/compute/apiv1/computepb"
+	gax "github.com/googleapis/gax-go/v2"
 	"google.golang.org/api/googleapi"
 	"google.golang.org/api/iterator"
 	"google.golang.org/protobuf/proto"
@@ -312,7 +314,34 @@ func createInstance(ctx context.Context, name, zone, machineType string, labels 
 		return err
 	}
 
-	return op.Wait(ctx)
+	return waitForOperationDone(ctx, op, operationPollInterval)
+}
+
+const operationPollInterval = 2 * time.Second
+
+type operationPoller interface {
+	Poll(ctx context.Context, opts ...gax.CallOption) error
+	Done() bool
+	Proto() *computepb.Operation
+}
+
+// Wait returns on the first failed poll, before the operation is DONE and
+// while the rolled-back instance is still listed; poll until DONE instead.
+func waitForOperationDone(ctx context.Context, op operationPoller, interval time.Duration) error {
+	for {
+		err := op.Poll(ctx)
+		if op.Done() {
+			return err
+		}
+		if err != nil && op.Proto().GetHttpErrorStatusCode() == 0 {
+			return err
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(interval):
+		}
+	}
 }
 
 // instanceExists reports whether an instance called name exists in any zone of project.
@@ -589,6 +618,9 @@ func classifyInsertError(err error) insertErrorKind {
 			case "alreadyExists":
 				return insertErrorAlreadyExists
 			}
+		}
+		if strings.Contains(apiErr.Message, "QUOTA_EXCEEDED") {
+			return insertErrorQuota
 		}
 		if apiErr.Code == 400 || apiErr.Code == 401 || apiErr.Code == 404 {
 			return insertErrorFatal
